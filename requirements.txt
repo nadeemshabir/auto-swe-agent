@@ -1,0 +1,5 @@
+tree-sitter>=0.21
+tree-sitter-python
+sentence-transformers
+chromadb
+tiktoken 
