@@ -1,0 +1,5 @@
+.venv/
+.env
+.chroma/
+__pycache__/
+*.pyc
