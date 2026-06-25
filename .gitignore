@@ -1,5 +1,17 @@
+# Python
 .venv/
-.env
-.chroma/
 __pycache__/
 *.pyc
+*.pyo
+
+# Environment secrets
+.env
+
+# Generated / runtime data (never commit these)
+.chroma/
+agent/.embedding_cache/
+.embedding_cache/
+
+# OS junk
+.DS_Store
+Thumbs.db

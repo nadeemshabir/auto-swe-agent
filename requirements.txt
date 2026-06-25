@@ -1,5 +1,10 @@
+# --- Week 1: codebase understanding ---
 tree-sitter>=0.21
 tree-sitter-python
 sentence-transformers
 chromadb
-tiktoken 
+
+# Token counting is provider-neutral and dependency-free in agent/retrieval.py
+# (a local estimate). Exact counts come from the active LLM provider's own
+# API at agent-loop time — see docs/llm-provider-abstraction.md. (tiktoken,
+# OpenAI's tokenizer, was removed: wrong for both Claude and Gemini.)
