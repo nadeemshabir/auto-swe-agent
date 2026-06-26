@@ -94,15 +94,24 @@ step + token budget the README promises.
   messages=...)` — use for budget-critical checks, not per-step.
 - Stream when `max_tokens` is large (≳16k) to avoid SDK HTTP timeouts.
 
-**Google Gemini (alternate, interface-level).**
-- SDK: `google-genai`. Map our canonical `complete()` onto
-  `generate_content` with **function calling** (Gemini's tool/`FunctionDeclaration`
-  shape); translate our `{name, description, input_schema}` tools into Gemini
-  `FunctionDeclaration`s and Gemini `functionCall` parts back into `ToolCall`.
-- Exact counts: Gemini's `count_tokens`.
-- Confirm current model ids, the function-calling request/response shape, and
-  token-counting call against Google's official `google-genai` docs before
-  implementing — those specifics are not pinned here.
+**Google Gemini (implemented — `agent/providers/gemini_provider.py`).**
+- SDK: `google-genai` (`from google import genai`), **manual** function calling
+  (automatic function calling disabled so the loop keeps control).
+- `client.models.generate_content(model, contents, config)` where `config =
+  types.GenerateContentConfig(system_instruction=…, tools=[types.Tool(
+  function_declarations=[…])], max_output_tokens=…,
+  automatic_function_calling=AutomaticFunctionCallingConfig(disable=True))`.
+- Our `{name, description, input_schema}` tools → `types.FunctionDeclaration(
+  parameters_json_schema=…)` (falls back to `parameters=` on older SDKs).
+- `messages` is a `list[types.Content]` with roles `user` | `model` | `tool`;
+  tool results go back as `Content(role="tool",
+  parts=[Part.from_function_response(name, response)])`.
+- Response → `response.function_calls`, `response.text`,
+  `response.usage_metadata.{prompt,candidates}_token_count`. Exact counts:
+  `client.models.count_tokens`.
+- Credentials: `GEMINI_API_KEY` / `GOOGLE_API_KEY`. Default model
+  `gemini-2.5-pro` (override via `LLM_MODEL`; verify the id is current for your
+  account — Gemini model names churn).
 
 > The retrieval layer (`agent/retrieval.py`) is already provider-neutral: it
 > embeds with a local sentence-transformer and estimates tokens locally, so it

@@ -42,17 +42,45 @@ The system has six layers, each independently testable and deployable:
 - **GitHub integration:** Live webhook-to-PR pipeline, no simulated APIs
 - **Production observability:** Distributed tracing, Prometheus metrics, Grafana dashboards, Kubernetes
 
+## Status
+
+By component (built out of strict week order):
+
+- **Environment setup:** Done ✅
+- **Codebase understanding** (`agent/retrieval.py`): Done ✅ — tree-sitter chunking, embeddings, ChromaDB, call graph, token-budgeted context
+- **ReAct reasoning loop** (`agent/loop.py` + `agent/providers/`): Core done ✅ — manual agentic loop, budget controller, sandboxed tools, pluggable Anthropic/Gemini providers
+- **GitHub integration** (`agent/github.py`): Not started
+- **Docker sandbox** (`agent/sandbox.py`): Not started
+- **Backend & queue** (`app/`, `workers/`): Not started
+- **Observability & deployment** (`monitoring/`, `k8s/`, `helm/`): Not started
+
 ## Usage
 
-Detailed usage instructions coming soon. Current project status:
+```bash
+# 1. Install dependencies (into your virtual environment)
+pip install -r requirements.txt
 
-- Week 0 (environment setup): Done ✅
-- Week 1 (codebase understanding): In progress
-- Week 2-8: Not started yet
+# 2. Verify the agent's tools and safety guards — no API key or model needed
+python -m agent.loop
+
+# 3. Pick a provider and set its key in .env
+#    ANTHROPIC_API_KEY=...                       # default provider (claude-opus-4-8)
+#    GEMINI_API_KEY=...   with LLM_PROVIDER=gemini  # alternative (gemini-2.5-pro)
+
+# 4. Run the agent on a real task against a repo (indexes it first)
+python -m agent.loop "Fix the off-by-one in paginate()" --workspace /path/to/repo --auto-index
+```
+
+The model and effort are configurable via env vars (`LLM_PROVIDER`, `LLM_MODEL`,
+`LLM_EFFORT`); budgets via CLI flags (`--max-steps`, `--max-usd`).
 
 ## Development
 
-See the `docs/` folder for the full 8-week project plan and weekly deep-dives on each component.
+The `docs/` folder has deep-dives on each component built so far:
+
+- [docs/retrieval.md](docs/retrieval.md) — the codebase understanding engine
+- [docs/loop.md](docs/loop.md) — the ReAct agent loop and tools
+- [docs/llm-provider-abstraction.md](docs/llm-provider-abstraction.md) — ADR: pluggable Anthropic/Gemini providers
 
 Core tech stack:
 

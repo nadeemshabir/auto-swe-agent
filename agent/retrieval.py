@@ -268,6 +268,7 @@ def index_repo(root: str):
                 'name':       c['name'],
                 'start_line': c['start_line'],
                 'end_line':   c['end_line'],
+                'repo':       os.path.abspath(root),
             } for c in chunks],
         )
         n_indexed += len(chunks)
@@ -279,10 +280,15 @@ def index_repo(root: str):
 #  — retrieve top-K relevant chunks for a query
 # ───────────────────────────────────────────────────────────────────────────
 
-def retrieve(query: str, k: int = 5) -> list[dict]:
+def retrieve(query: str, repo: str = None, k: int = 5) -> list[dict]:
     """Return top-K chunks most semantically similar to the query."""
     qvec = get_embedder().encode(query).tolist()
-    res  = COLLECTION.query(query_embeddings=[qvec], n_results=k)
+    
+    kwargs = {'query_embeddings': [qvec], 'n_results': k}
+    if repo:
+        kwargs['where'] = {'repo': os.path.abspath(repo)}
+        
+    res  = COLLECTION.query(**kwargs)
 
     # Chroma returns parallel lists; zip into per-result dicts
     out = []
@@ -334,12 +340,12 @@ def build_call_graph(root: str) -> dict[str, set[str]]:
 # — context assembler: pack top-K chunks under a token budget
 # ───────────────────────────────────────────────────────────────────────────
 
-def assemble_context(query: str, k: int = 10, token_budget: int = 4000) -> str:
+def assemble_context(query: str, repo: str = None, k: int = 10, token_budget: int = 4000) -> str:
     """
     Retrieve top-K chunks for `query`, pack as many as fit under `token_budget`.
     Returns one string ready to drop into an LLM prompt.
     """
-    chunks = retrieve(query, k=k)
+    chunks = retrieve(query, repo=repo, k=k)
 
     out_parts = []
     used = 0
@@ -379,7 +385,7 @@ if __name__ == '__main__':
     ]
     for q in queries:
         print(f"\n🔍 Query: {q!r}")
-        for r in retrieve(q, k=3):
+        for r in retrieve(q, repo=test_repo, k=3):
             md = r['metadata']
             fname = os.path.basename(md['file'])
             print(f"   [{md['kind']:8}] {md['name'][:40]:40}  ({fname}:{md['start_line']})  dist={r['distance']:.3f}")
@@ -391,6 +397,6 @@ if __name__ == '__main__':
         print(f"   {short} → {sorted(callees)}")
 
     print("\n=== CONTEXT ASSEMBLER (under 500 tokens) ===")
-    ctx = assemble_context("arithmetic operations", k=5, token_budget=500)
+    ctx = assemble_context("arithmetic operations", repo=test_repo, k=5, token_budget=500)
     print(ctx)
     print(f"\n(Total ≈ {count_tokens(ctx)} tokens)")
