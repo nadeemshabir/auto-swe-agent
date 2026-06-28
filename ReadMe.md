@@ -49,7 +49,7 @@ By component (built out of strict week order):
 - **Environment setup:** Done ✅
 - **Codebase understanding** (`agent/retrieval.py`): Done ✅ — tree-sitter chunking, embeddings, ChromaDB, call graph, token-budgeted context
 - **ReAct reasoning loop** (`agent/loop.py` + `agent/providers/`): Core done ✅ — manual agentic loop, budget controller, sandboxed tools, pluggable Anthropic/Gemini providers
-- **GitHub integration** (`agent/github.py`): Not started
+- **GitHub integration** (`agent/github.py`): Done ✅ — stdlib REST client (rate-limit + transient-failure retries, idempotent PR creation), git helpers (token never persisted/leaked), webhook→issue parsing, offline self-test
 - **Docker sandbox** (`agent/sandbox.py`): Not started
 - **Backend & queue** (`app/`, `workers/`): Not started
 - **Observability & deployment** (`monitoring/`, `k8s/`, `helm/`): Not started
@@ -80,6 +80,7 @@ The `docs/` folder has deep-dives on each component built so far:
 
 - [docs/retrieval.md](docs/retrieval.md) — the codebase understanding engine
 - [docs/loop.md](docs/loop.md) — the ReAct agent loop and tools
+- [docs/github.md](docs/github.md) — GitHub integration: issue intake, PR output, git helpers
 - [docs/llm-provider-abstraction.md](docs/llm-provider-abstraction.md) — ADR: pluggable Anthropic/Gemini providers
 
 Core tech stack:

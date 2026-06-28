@@ -9,9 +9,15 @@ chromadb
 # Install the SDK for whichever provider you use; both are listed so either works.
 anthropic>=0.40            # LLM_PROVIDER=anthropic (default, claude-opus-4-8)
 google-genai>=1.0          # LLM_PROVIDER=gemini   (gemini-2.5-pro)
+python-dotenv              # loads .env into os.environ
 pytest                     # used by the agent's run_tests tool
 
 # Token counting is provider-neutral and dependency-free in agent/retrieval.py
 # (a local estimate). Exact counts come from the active LLM provider's own
 # API at agent-loop time. (tiktoken, OpenAI's tokenizer, was removed: wrong
 # for both Claude and Gemini.)
+
+# --- GitHub integration ---
+# agent/github.py deliberately adds NO dependency: the REST client is pure
+# stdlib (urllib), and git operations shell out to the `git` CLI. It only needs
+# `git` on PATH and GITHUB_TOKEN in the environment for live calls.

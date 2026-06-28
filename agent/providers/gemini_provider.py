@@ -68,12 +68,15 @@ class GeminiProvider:
         max_tokens: int,
     ) -> LLMResponse:
         types = self._types
-        config = types.GenerateContentConfig(
-            system_instruction=system or None,
-            max_output_tokens=max_tokens,
-            tools=[self._tool(tools)] if tools else None,
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        )
+        try:
+            config = types.GenerateContentConfig(
+                system_instruction=system or None,
+                max_output_tokens=max_tokens,
+                tools=[self._tool(tools)] if tools else None,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            )
+        except Exception as e:
+            raise ProviderError(f"could not build Gemini request: {e}") from e
 
         try:
             resp = self.client.models.generate_content(
@@ -82,29 +85,34 @@ class GeminiProvider:
         except Exception as e:
             raise ProviderError(f"Gemini API error: {e}") from e
 
-        candidate = (resp.candidates or [None])[0]
+        try:
+            candidate = (resp.candidates or [None])[0]
 
-        # text (collect from parts to avoid SDK warnings when only tool calls exist)
-        text = ""
-        if candidate is not None and candidate.content and candidate.content.parts:
-            text = "".join(p.text for p in candidate.content.parts if getattr(p, "text", None))
+            # text (collect from parts to avoid SDK warnings when only tool calls exist)
+            text = ""
+            if candidate is not None and candidate.content and candidate.content.parts:
+                text = "".join(p.text for p in candidate.content.parts if getattr(p, "text", None))
 
-        # tool calls
-        tool_calls = []
-        for i, fc in enumerate(resp.function_calls or []):
-            tool_calls.append(ToolCall(id=f"{fc.name}-{i}", name=fc.name, args=dict(fc.args or {})))
+            # tool calls
+            tool_calls = []
+            for i, fc in enumerate(resp.function_calls or []):
+                tool_calls.append(ToolCall(id=f"{fc.name}-{i}", name=fc.name, args=dict(fc.args or {})))
 
-        usage = Usage(
-            input_tokens=getattr(resp.usage_metadata, "prompt_token_count", 0) or 0,
-            output_tokens=getattr(resp.usage_metadata, "candidates_token_count", 0) or 0,
-        )
+            usage = Usage(
+                input_tokens=getattr(resp.usage_metadata, "prompt_token_count", 0) or 0,
+                output_tokens=getattr(resp.usage_metadata, "candidates_token_count", 0) or 0,
+            )
+            stop_reason = self._stop_reason(candidate, bool(tool_calls))
+            raw = candidate.content if candidate is not None else None
+        except Exception as e:
+            raise ProviderError(f"could not parse Gemini response: {e}") from e
 
         return LLMResponse(
             text=text,
             tool_calls=tool_calls,
-            stop_reason=self._stop_reason(candidate, bool(tool_calls)),
+            stop_reason=stop_reason,
             usage=usage,
-            raw=(candidate.content if candidate is not None else None),
+            raw=raw,
         )
 
     # ── message construction ──────────────────────────────────────────────────

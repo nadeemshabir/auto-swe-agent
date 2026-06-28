@@ -1,6 +1,6 @@
 """
 agent/loop.py
-Week 3: the ReAct reasoning loop — Reason → Act → Observe.
+the ReAct reasoning loop — Reason → Act → Observe.
 
 The agent is handed a task (e.g. a GitHub issue) and a workspace (a checked-out
 repo). It drives a provider-agnostic LLM through a manual agentic loop:
@@ -31,10 +31,19 @@ Offline self-test: python -m agent.loop            (exercises tools, no API key 
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+
+# Load .env so that ANTHROPIC_API_KEY, LLM_PROVIDER, budget limits etc.
+# are visible to os.getenv() throughout the process.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / '.env')
+except ImportError:
+    pass  # python-dotenv not installed; user must export vars manually
 
 try:
     from .providers import ProviderError, ToolCall, ToolSpec, Usage, get_provider
@@ -85,10 +94,12 @@ Working rules:
 @dataclass
 class Budget:
     """Hard caps on a single run. `exhausted()` is checked before every model
-    call; `record()` accrues usage after each one."""
-    max_steps: int = 30
-    max_total_tokens: int = 500_000     # cumulative input + output
-    max_usd: float = 5.0
+    call; `record()` accrues usage after each one.
+    Defaults are read from .env (MAX_STEPS, MAX_TOTAL_TOKENS, MAX_USD),
+    falling back to safe hardcoded values."""
+    max_steps: int = field(default_factory=lambda: int(os.getenv('MAX_STEPS', '30')))
+    max_total_tokens: int = field(default_factory=lambda: int(os.getenv('MAX_TOTAL_TOKENS', '500000')))
+    max_usd: float = field(default_factory=lambda: float(os.getenv('MAX_USD', '5.0')))
 
     steps: int = 0
     total: Usage = field(default_factory=Usage)
@@ -112,16 +123,18 @@ class Budget:
 # ═════════════════════════════════════════════════════════════════════════════
 # Tools — all file access confined to the workspace
 # ═════════════════════════════════════════════════════════════════════════════
-
+ #didn't understood why we exactly need this ToolError Exception class
+ # if the tool fails it will return error message and if it fails again then we will stop the loop
+ # correct me if i am wrong
 class ToolError(Exception):
     """A recoverable tool failure. Surfaced to the model as is_error, not raised
     out of the loop."""
 
-
+#makes sure LLM can't access files outside the workspace/repo
 def _safe_path(workspace: Path, p: str | None) -> Path:
     """Resolve `p` (relative to workspace, or absolute) and refuse anything
     outside the workspace root — blocks path traversal (../../etc/passwd)."""
-    if not p or not str(p).strip():
+    if not p or not str(p).strip(): 
         raise ToolError("path is required")
     cand = Path(p)
     target = (cand if cand.is_absolute() else workspace / cand).resolve()
@@ -129,7 +142,7 @@ def _safe_path(workspace: Path, p: str | None) -> Path:
         raise ToolError(f"path {p!r} escapes the workspace root")
     return target
 
-
+#if output is very big then truncate it to last {limit} chars, because those are the ones which actually matter
 def _tail(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
@@ -141,6 +154,8 @@ def _clip(text: str, limit: int) -> str:
         return text
     return text[:limit] + f"\n... [truncated to first {limit} chars]"
 
+# why we exactly need this why not we use the read_text directly?
+# 
 
 def _read_text(path: Path) -> str:
     """Read as UTF-8 with newlines normalized to LF. Uses read_bytes (not
@@ -153,7 +168,7 @@ def _write_text(path: Path, text: str) -> None:
     """Write UTF-8 with LF endings, bypassing platform newline translation."""
     path.write_bytes(text.encode("utf-8"))
 
-
+#imports retrieval module when needed - lazy import otherwise it will import the whole module every time when called. + it handles the import error also
 def _load_retrieval():
     """Lazy import — retrieval pulls in heavy ML deps and a Chroma client."""
     try:
@@ -168,28 +183,63 @@ def default_tools(workspace: Path) -> dict[str, tuple[ToolSpec, "callable"]]:
     Returns name -> (spec, handler). A handler takes the model's args dict and
     returns a string, or raises ToolError."""
 
+    #retrieve context tool - semantic search, this is where the context is retrieved from the codebase
+    # it takes query and k as arguments
+    # it returns the context in the form of string
+    # k is optional and it defaults to 8, number of chunks extracted
+    # it uses openai embeddings to get the context
+    # it uses chromaDB to store and retrieve the context
     def retrieve_context(args: dict) -> str:
         query = args.get("query")
         if not query:
             raise ToolError("query is required")
-        k = int(args.get("k", 8))
-        retrieval = _load_retrieval()
-        ctx = retrieval.assemble_context(query, k=k, token_budget=RETRIEVE_TOKEN_BUDGET)
+        try:
+            k = int(args.get("k", 8))
+        except (TypeError, ValueError):
+            raise ToolError("k must be an integer")
+        if k < 1:
+            raise ToolError("k must be >= 1")
+        try:
+            retrieval = _load_retrieval()
+        except ImportError as e:
+            raise ToolError(f"retrieval is unavailable (missing dependency): {e}")
+        try:
+            ctx = retrieval.assemble_context(
+                query, repo=str(workspace), k=k,
+                token_budget=RETRIEVE_TOKEN_BUDGET,
+            )
+        except Exception as e:
+            raise ToolError(f"retrieval failed: {e}")
         return ctx or "(no relevant code found — try another query, or index the repo first)"
-
+        
+    #read file tool - it reads the file and returns the content of the file
+    # it takes path as argument
+    # it returns the content of the file in the form of string
+    # path is required
+    # if the file is not found it will raise ToolError
+    # if the file is not a file it will raise ToolError
     def read_file(args: dict) -> str:
         target = _safe_path(workspace, args.get("path"))
         if not target.exists():
             raise ToolError(f"file not found: {args.get('path')}")
         if not target.is_file():
             raise ToolError(f"not a file: {args.get('path')}")
-        data = target.read_bytes()
+        try:
+            data = target.read_bytes()
+        except OSError as e:
+            raise ToolError(f"could not read {args.get('path')}: {e}")
         truncated = len(data) > MAX_READ_BYTES
         text = data[:MAX_READ_BYTES].decode("utf-8", "replace").replace("\r\n", "\n").replace("\r", "\n")
         if truncated:
             text += f"\n... [file truncated at {MAX_READ_BYTES} bytes]"
         return text
 
+    #edit file tool - it edits the file and returns the content of the file
+    # it takes path, old_string and new_string as arguments
+    # it returns the content of the file in the form of string
+    # path is required
+    # old_string is required
+    # new_string is optional and it defaults to ""
     def edit_file(args: dict) -> str:
         path = args.get("path")
         old = args.get("old_string", "")
@@ -202,13 +252,19 @@ def default_tools(workspace: Path) -> dict[str, tuple[ToolSpec, "callable"]]:
                     f"{path} already exists; to modify it pass the exact text to "
                     f"replace as old_string"
                 )
-            target.parent.mkdir(parents=True, exist_ok=True)
-            _write_text(target, new)
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _write_text(target, new)
+            except OSError as e:
+                raise ToolError(f"could not create {path}: {e}")
             return f"created {path} ({len(new)} bytes)"
 
         if not target.exists():
             raise ToolError(f"file not found: {path}")
-        content = _read_text(target)
+        try:
+            content = _read_text(target)
+        except OSError as e:
+            raise ToolError(f"could not read {path}: {e}")
         count = content.count(old)
         if count == 0:
             raise ToolError(
@@ -220,13 +276,28 @@ def default_tools(workspace: Path) -> dict[str, tuple[ToolSpec, "callable"]]:
                 f"old_string matches {count} places; add surrounding context so "
                 f"it is unique"
             )
-        _write_text(target, content.replace(old, new, 1))
+        try:
+            _write_text(target, content.replace(old, new, 1))
+        except OSError as e:
+            raise ToolError(f"could not write {path}: {e}")
         return f"edited {path} (1 replacement)"
 
+    #run tests tool - it runs the tests and returns the output of the tests
+    # it takes target as argument
+    # it returns the output of the tests in the form of string
+    # target is optional and it defaults to ""
     def run_tests(args: dict) -> str:
         target = args.get("target") or ""
         target_arg = str(_safe_path(workspace, target)) if target else str(workspace)
-        cmd = [sys.executable, "-m", "pytest", "-q", target_arg]
+
+        # Use the workspace's own venv Python if it exists, so tests run
+        # with the correct dependencies — not the agent's own venv.
+        ws_python = workspace / '.venv' / 'bin' / 'python'
+        if not ws_python.exists():
+            ws_python = workspace / '.venv' / 'Scripts' / 'python.exe'  # Windows
+        python = str(ws_python) if ws_python.exists() else sys.executable
+
+        cmd = [python, "-m", "pytest", "-q", target_arg]
         try:
             proc = subprocess.run(
                 cmd, cwd=str(workspace), capture_output=True, text=True,
@@ -234,18 +305,26 @@ def default_tools(workspace: Path) -> dict[str, tuple[ToolSpec, "callable"]]:
             )
         except subprocess.TimeoutExpired:
             raise ToolError(f"tests timed out after {RUN_TESTS_TIMEOUT}s")
-        except FileNotFoundError as e:  # pragma: no cover
+        except (FileNotFoundError, OSError) as e:  # pragma: no cover
             raise ToolError(f"could not launch pytest: {e}")
         out = _tail((proc.stdout or "") + (proc.stderr or ""), MAX_TOOL_RESULT_CHARS)
         return f"exit code: {proc.returncode}\n{out}"
-
+    
+    #list directory tool - it lists the directory and returns the content of the directory
+    # it takes path as argument
+    # it returns the content of the directory in the form of string
+    # path is optional and it defaults to "."
     def list_dir(args: dict) -> str:
         target = _safe_path(workspace, args.get("path", "."))
         if not target.is_dir():
             raise ToolError(f"not a directory: {args.get('path')}")
         skip = {".venv", "__pycache__", ".git", "node_modules", ".chroma", ".embedding_cache"}
         out = []
-        for child in sorted(target.iterdir()):
+        try:
+            children = sorted(target.iterdir())
+        except OSError as e:
+            raise ToolError(f"could not list {args.get('path')}: {e}")
+        for child in children:
             if child.name in skip:
                 continue
             out.append(child.name + ("/" if child.is_dir() else ""))
@@ -337,15 +416,20 @@ def default_tools(workspace: Path) -> dict[str, tuple[ToolSpec, "callable"]]:
 # Result
 # ═════════════════════════════════════════════════════════════════════════════
 
+#dataclass for storing the result of the run
 @dataclass
 class RunResult:
     status: str            # completed | refused | max_steps | token_budget
                           #  | usd_budget | max_tokens | provider_error
+                          #  | index_error | error
     final_text: str
     steps: list[dict]
     budget: Budget
 
     def summary(self) -> str:
+        """
+        Return a one-line summary of the run.
+        """
         b = self.budget
         return (
             f"[{self.status}] steps={b.steps} "
@@ -353,10 +437,11 @@ class RunResult:
             f"cost=${b.spent_usd:.4f}"
         )
 
-
+ 
 # ═════════════════════════════════════════════════════════════════════════════
 # The agent
 # ═════════════════════════════════════════════════════════════════════════════
+
 
 class ReActAgent:
     def __init__(
@@ -378,10 +463,11 @@ class ReActAgent:
         self.max_output_tokens = max_output_tokens
         self.tools = tools or default_tools(self.workspace)
         self._specs = [spec for spec, _ in self.tools.values()]
-        self._auto_index = auto_index
+        self._auto_index = auto_index 
+        #indexing: embedding the file contents using OpenAI and storing them in the vector database
 
     # ── tool dispatch ─────────────────────────────────────────────────────────
-
+    #tool dispatch: a function that takes a tool call and returns the result of the tool call
     def _dispatch(self, call: ToolCall) -> tuple[str, bool]:
         """Run one tool. Returns (content, is_error). Never raises."""
         entry = self.tools.get(call.name)
@@ -398,14 +484,21 @@ class ReActAgent:
             return (f"tool '{call.name}' failed unexpectedly: {e}", True)
 
     # ── main loop ─────────────────────────────────────────────────────────────
-
+    #the main loop of the agent that takes a task and returns the result of the task
+    #takes a task as a string and returns a RunResult object
+    #uses the provider, tools, budget, system prompt, and max_output_tokens to complete the task
+    
     def run(self, task: str) -> RunResult:
         if not task or not task.strip():
             raise ValueError("task must be a non-empty string")
 
         if self._auto_index:
             log.info("indexing workspace %s ...", self.workspace)
-            self._load_and_index()
+            try:
+                self._load_and_index()
+            except Exception as e:
+                log.error("indexing failed: %s", e)
+                return RunResult("index_error", f"failed to index workspace: {e}", [], self.budget)
 
         messages = [self.provider.user_message(task)]
         steps: list[dict] = []
@@ -427,9 +520,22 @@ class ReActAgent:
             except ProviderError as e:
                 log.error("provider error: %s", e)
                 return RunResult("provider_error", str(e), steps, self.budget)
+            except Exception as e:  # unexpected SDK / parsing failure
+                log.exception("unexpected error during model call")
+                return RunResult("error", f"unexpected error: {e}", steps, self.budget)
 
-            self.budget.record(resp.usage, self.provider.cost_usd(resp.usage))
-            messages.append(self.provider.assistant_turn(resp))
+            try:
+                cost = self.provider.cost_usd(resp.usage)
+            except Exception:
+                cost = 0.0   # a pricing glitch must never break a run
+            self.budget.record(resp.usage, cost)
+
+            try:
+                messages.append(self.provider.assistant_turn(resp))
+            except Exception as e:
+                log.error("could not append assistant turn: %s", e)
+                return RunResult("provider_error", f"malformed provider response: {e}", steps, self.budget)
+
             if resp.text:
                 final_text = resp.text
 
@@ -459,7 +565,11 @@ class ReActAgent:
                         "is_error": is_error,
                         "result": _clip(content, 300),
                     })
-                messages.append(self.provider.tool_result_message(results))
+                try:
+                    messages.append(self.provider.tool_result_message(results))
+                except Exception as e:
+                    log.error("could not build tool results: %s", e)
+                    return RunResult("provider_error", f"could not return tool results: {e}", steps, self.budget)
                 steps.append(step)
                 continue
 
@@ -540,12 +650,17 @@ def _main(argv: list[str]) -> int:
         return 0
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    result = run(
-        args.task,
-        workspace=args.workspace,
-        auto_index=args.auto_index,
-        budget=Budget(max_steps=args.max_steps, max_usd=args.max_usd),
-    )
+    try:
+        result = run(
+            args.task,
+            workspace=args.workspace,
+            auto_index=args.auto_index,
+            budget=Budget(max_steps=args.max_steps, max_usd=args.max_usd),
+        )
+    except (ProviderError, ValueError) as e:
+        # e.g. missing SDK / API key, or a bad workspace path
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     print("\n" + "=" * 70)
     print(result.summary())
     print("=" * 70)

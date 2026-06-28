@@ -94,22 +94,27 @@ class AnthropicProvider:
 
         resp = self._create_with_fallback(kwargs)
 
-        text = "".join(
-            getattr(b, "text", "") for b in resp.content if b.type == "text"
-        )
-        tool_calls = [
-            ToolCall(id=b.id, name=b.name, args=b.input)
-            for b in resp.content
-            if b.type == "tool_use"
-        ]
-        usage = Usage(
-            input_tokens=getattr(resp.usage, "input_tokens", 0) or 0,
-            output_tokens=getattr(resp.usage, "output_tokens", 0) or 0,
-        )
+        try:
+            text = "".join(
+                getattr(b, "text", "") for b in resp.content if b.type == "text"
+            )
+            tool_calls = [
+                ToolCall(id=b.id, name=b.name, args=b.input)
+                for b in resp.content
+                if b.type == "tool_use"
+            ]
+            usage = Usage(
+                input_tokens=getattr(resp.usage, "input_tokens", 0) or 0,
+                output_tokens=getattr(resp.usage, "output_tokens", 0) or 0,
+            )
+            stop_reason = resp.stop_reason or "end_turn"
+        except Exception as e:
+            raise ProviderError(f"could not parse Anthropic response: {e}") from e
+
         return LLMResponse(
             text=text,
             tool_calls=tool_calls,
-            stop_reason=resp.stop_reason or "end_turn",
+            stop_reason=stop_reason,
             usage=usage,
             raw=resp.content,
         )

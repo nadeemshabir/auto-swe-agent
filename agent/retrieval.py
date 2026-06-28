@@ -23,6 +23,7 @@ import os
 import ast
 import json
 import math
+import logging
 import hashlib
 from pathlib import Path
 
@@ -30,6 +31,8 @@ import tree_sitter_python
 from tree_sitter import Language, Parser
 from sentence_transformers import SentenceTransformer
 import chromadb
+
+log = logging.getLogger("agent.retrieval")
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -57,8 +60,13 @@ def get_embedder():
     """Load the embedding model on first call, reuse afterwards."""
     global _EMB_MODEL
     if _EMB_MODEL is None:
-        print(f"Loading embedding model {EMBED_MODEL_NAME} (first run downloads ~80MB)...")
-        _EMB_MODEL = SentenceTransformer(EMBED_MODEL_NAME)
+        log.info("Loading embedding model %s (first run downloads ~80MB)...", EMBED_MODEL_NAME)
+        try:
+            _EMB_MODEL = SentenceTransformer(EMBED_MODEL_NAME)
+        except Exception as e:  # download/network/model-load failure
+            raise RuntimeError(
+                f"failed to load embedding model {EMBED_MODEL_NAME!r}: {e}"
+            ) from e
     return _EMB_MODEL
 
 # ChromaDB — persistent local store
@@ -106,6 +114,18 @@ def _unwrap(node):
     return node
 
 
+def _node_name(node) -> str | None:
+    """Decoded name of a def/class node, or None if the tree is malformed
+    (e.g. a syntax error left the `name` field missing)."""
+    name_node = node.child_by_field_name('name')
+    if name_node is None:
+        return None
+    try:
+        return name_node.text.decode()
+    except (UnicodeDecodeError, AttributeError):
+        return None
+
+
 def parse_file(path: str) -> list[dict]:
     """Parse a Python file into semantic chunks.
 
@@ -115,10 +135,17 @@ def parse_file(path: str) -> list[dict]:
     token limit), and one per import statement. Decorated defs/classes are
     unwrapped so their decorators are included but the kind/name is correct.
     """
-    with open(path, 'rb') as f:
-        source = f.read()
+    try:
+        with open(path, 'rb') as f:
+            source = f.read()
+        tree = PY_PARSER.parse(source)
+    except OSError as e:
+        log.warning("could not read %s: %s", path, e)
+        return []
+    except Exception as e:  # tree-sitter parse failure
+        log.warning("could not parse %s: %s", path, e)
+        return []
 
-    tree = PY_PARSER.parse(source)
     chunks = []
 
     for node in tree.root_node.children:
@@ -128,7 +155,9 @@ def parse_file(path: str) -> list[dict]:
             continue
 
         if real.type == 'function_definition':
-            name = real.child_by_field_name('name').text.decode()
+            name = _node_name(real)
+            if name is None:
+                continue
             chunks.append({
                 'kind':       'function',
                 'name':       name,
@@ -139,7 +168,9 @@ def parse_file(path: str) -> list[dict]:
             })
 
         elif real.type == 'class_definition':
-            class_name = real.child_by_field_name('name').text.decode()
+            class_name = _node_name(real)
+            if class_name is None:
+                continue
             body = real.child_by_field_name('body')
 
             # collect (outer, inner) for each method, unwrapping decorators
@@ -152,7 +183,9 @@ def parse_file(path: str) -> list[dict]:
 
             # one chunk per method
             for outer, inner in methods:
-                mname = inner.child_by_field_name('name').text.decode()
+                mname = _node_name(inner)
+                if mname is None:
+                    continue
                 chunks.append({
                     'kind':       'method',
                     'name':       f"{class_name}.{mname}",
@@ -214,18 +247,28 @@ def embed_many(codes: list[str]) -> list[list[float]]:
     for i, code in enumerate(codes):
         cache_file = CACHE_DIR / f"{chunk_hash(code)}.json"
         if cache_file.exists():
-            with open(cache_file) as f:
-                vectors[i] = json.load(f)
-        else:
-            misses.append((i, code, cache_file))
+            try:
+                with open(cache_file) as f:
+                    vectors[i] = json.load(f)
+                continue
+            except (json.JSONDecodeError, OSError) as e:
+                # a truncated/garbled cache entry must not poison the run
+                log.warning("ignoring corrupt embedding cache %s: %s", cache_file.name, e)
+        misses.append((i, code, cache_file))
 
     if misses:
-        encoded = get_embedder().encode([c for _, c, _ in misses])
+        try:
+            encoded = get_embedder().encode([c for _, c, _ in misses])
+        except Exception as e:
+            raise RuntimeError(f"embedding failed: {e}") from e
         for (i, _code, cache_file), vec in zip(misses, encoded):
             v = vec.tolist()
             vectors[i] = v
-            with open(cache_file, 'w') as f:
-                json.dump(v, f)
+            try:
+                with open(cache_file, 'w') as f:
+                    json.dump(v, f)
+            except OSError as e:
+                log.warning("could not write embedding cache %s: %s", cache_file.name, e)
 
     return vectors  # type: ignore[return-value]
 
@@ -246,33 +289,44 @@ def index_repo(root: str):
     fresh chunks are written, so edits (which shift line numbers and thus
     chunk IDs) don't leave orphaned duplicates behind."""
     n_indexed = 0
+    n_errors = 0
 
     for fpath in walk_py_files(root):
-        chunks = parse_file(fpath)
-        if not chunks:
+        try:
+            chunks = parse_file(fpath)
+            if not chunks:
+                continue
+
+            # drop any stale chunks from a previous index of this file
+            COLLECTION.delete(where={'file': fpath})
+
+            vectors = embed_many([c['code'] for c in chunks])
+            ids = [f"{c['file']}:{c['start_line']}-{c['end_line']}:{c['kind']}" for c in chunks]
+
+            COLLECTION.upsert(
+                ids        = ids,
+                embeddings = vectors,
+                documents  = [c['code'] for c in chunks],
+                metadatas  = [{
+                    'file':       c['file'],
+                    'kind':       c['kind'],
+                    'name':       c['name'],
+                    'start_line': c['start_line'],
+                    'end_line':   c['end_line'],
+                    'repo':       os.path.abspath(root),
+                } for c in chunks],
+            )
+            n_indexed += len(chunks)
+        except Exception as e:
+            # one unindexable file (bad encoding, embed/Chroma hiccup) must not
+            # abort the whole repo — log it and keep going
+            n_errors += 1
+            log.error("failed to index %s: %s", fpath, e)
             continue
 
-        # drop any stale chunks from a previous index of this file
-        COLLECTION.delete(where={'file': fpath})
-
-        vectors = embed_many([c['code'] for c in chunks])
-        ids = [f"{c['file']}:{c['start_line']}-{c['end_line']}:{c['kind']}" for c in chunks]
-
-        COLLECTION.upsert(
-            ids        = ids,
-            embeddings = vectors,
-            documents  = [c['code'] for c in chunks],
-            metadatas  = [{
-                'file':       c['file'],
-                'kind':       c['kind'],
-                'name':       c['name'],
-                'start_line': c['start_line'],
-                'end_line':   c['end_line'],
-                'repo':       os.path.abspath(root),
-            } for c in chunks],
-        )
-        n_indexed += len(chunks)
-
+    if n_errors:
+        log.warning("indexing finished with %d file error(s); %d chunks indexed",
+                    n_errors, n_indexed)
     return n_indexed
 
 
@@ -280,24 +334,35 @@ def index_repo(root: str):
 #  — retrieve top-K relevant chunks for a query
 # ───────────────────────────────────────────────────────────────────────────
 
-def retrieve(query: str, repo: str = None, k: int = 5) -> list[dict]:
-    """Return top-K chunks most semantically similar to the query."""
-    qvec = get_embedder().encode(query).tolist()
-    
-    kwargs = {'query_embeddings': [qvec], 'n_results': k}
-    if repo:
-        kwargs['where'] = {'repo': os.path.abspath(repo)}
-        
-    res  = COLLECTION.query(**kwargs)
+def retrieve(query: str, repo: str | None = None, k: int = 5) -> list[dict]:
+    """Return top-K chunks most semantically similar to the query.
+    Returns [] on an empty query or any retrieval failure (logged)."""
+    if not query or not str(query).strip():
+        return []
 
-    # Chroma returns parallel lists; zip into per-result dicts
+    try:
+        qvec = get_embedder().encode(query).tolist()
+        kwargs = {'query_embeddings': [qvec], 'n_results': k}
+        if repo:
+            kwargs['where'] = {'repo': os.path.abspath(repo)}
+        res = COLLECTION.query(**kwargs)
+    except Exception as e:
+        log.error("retrieval query failed: %s", e)
+        return []
+
+    # Chroma returns parallel lists; guard against empty/missing fields.
+    ids   = (res.get('ids')        or [[]])[0]
+    docs  = (res.get('documents')  or [[]])[0]
+    metas = (res.get('metadatas')  or [[]])[0]
+    dists = (res.get('distances')  or [[]])[0]
+
     out = []
-    for i in range(len(res['ids'][0])):
+    for i in range(len(ids)):
         out.append({
-            'id':       res['ids'][0][i],
-            'code':     res['documents'][0][i],
-            'metadata': res['metadatas'][0][i],
-            'distance': res['distances'][0][i],   # smaller = more similar
+            'id':       ids[i],
+            'code':     docs[i]  if i < len(docs)  else '',
+            'metadata': metas[i] if i < len(metas) else {},
+            'distance': dists[i] if i < len(dists) else None,   # smaller = more similar
         })
     return out
 
