@@ -1,0 +1,19 @@
+# Normalize line endings. The agent's own file I/O (loop.py _read_text/_write_text)
+# deliberately works in LF, and everything ultimately runs on Linux (sandbox,
+# workers, CI) — so source files are checked out LF everywhere, including on
+# Windows dev machines. This also silences git's LF/CRLF warnings.
+* text=auto
+*.py            text eol=lf
+*.md            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.toml          text eol=lf
+*.Dockerfile    text eol=lf
+Dockerfile*     text eol=lf
+*.sh            text eol=lf
+
+# Binary — never touch
+*.png  binary
+*.jpg  binary
+*.sqlite3 binary
+*.bin  binary

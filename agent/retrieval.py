@@ -36,14 +36,16 @@ log = logging.getLogger("agent.retrieval")
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Paths anchored to this file, not the current working directory, so the
-# store is stable no matter where the process is launched from.
+# Paths: env-overridable (CHROMA_DIR / EMBEDDING_CACHE_DIR) so a deployment
+# can point them at a persistent volume (plan §7.3/§7.4); the default is
+# anchored to this file, not the CWD, so dev runs are stable no matter where
+# the process is launched from. Directories are created lazily on first use —
+# importing this module must have no filesystem side effects.
 # ───────────────────────────────────────────────────────────────────────────
 
-BASE_DIR  = Path(__file__).resolve().parent
-CHROMA_DIR = BASE_DIR / '.chroma'
-CACHE_DIR  = BASE_DIR / '.embedding_cache'
-CACHE_DIR.mkdir(exist_ok=True)
+BASE_DIR   = Path(__file__).resolve().parent
+CHROMA_DIR = Path(os.getenv('CHROMA_DIR', str(BASE_DIR / '.chroma')))
+CACHE_DIR  = Path(os.getenv('EMBEDDING_CACHE_DIR', str(BASE_DIR / '.embedding_cache')))
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -69,9 +71,19 @@ def get_embedder():
             ) from e
     return _EMB_MODEL
 
-# ChromaDB — persistent local store
-CHROMA_CLIENT = chromadb.PersistentClient(path=str(CHROMA_DIR))
-COLLECTION    = CHROMA_CLIENT.get_or_create_collection('code')
+# ChromaDB — persistent local store, opened lazily on first use. Opening a
+# PersistentClient at import time created the .chroma dir as a side effect of
+# merely importing this module and made every importer pay the startup cost.
+_CHROMA_CLIENT = None
+_COLLECTION = None
+
+def get_collection():
+    """Open (once) and return the chunk collection."""
+    global _CHROMA_CLIENT, _COLLECTION
+    if _COLLECTION is None:
+        _CHROMA_CLIENT = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        _COLLECTION = _CHROMA_CLIENT.get_or_create_collection('code')
+    return _COLLECTION
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -241,6 +253,7 @@ def embed_many(codes: list[str]) -> list[list[float]]:
 
     Cached on disk by content hash; cache misses are encoded in a single
     batch (much faster than one-at-a-time)."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)   # lazily, on first real use
     vectors: list[list[float] | None] = [None] * len(codes)
     misses = []  # (index, code, cache_file)
 
@@ -290,20 +303,27 @@ def index_repo(root: str):
     chunk IDs) don't leave orphaned duplicates behind."""
     n_indexed = 0
     n_errors = 0
+    collection = get_collection()
 
     for fpath in walk_py_files(root):
+        # Normalize to an absolute path. Chunk IDs and the delete-by-file
+        # filter are keyed on this string — if the same repo were indexed via
+        # a relative path once and an absolute path later, the forms would not
+        # match and stale duplicate chunks would survive re-indexing (and two
+        # different repos indexed relatively could even collide).
+        fpath = os.path.abspath(fpath)
         try:
             chunks = parse_file(fpath)
             if not chunks:
                 continue
 
             # drop any stale chunks from a previous index of this file
-            COLLECTION.delete(where={'file': fpath})
+            collection.delete(where={'file': fpath})
 
             vectors = embed_many([c['code'] for c in chunks])
             ids = [f"{c['file']}:{c['start_line']}-{c['end_line']}:{c['kind']}" for c in chunks]
 
-            COLLECTION.upsert(
+            collection.upsert(
                 ids        = ids,
                 embeddings = vectors,
                 documents  = [c['code'] for c in chunks],
@@ -345,7 +365,7 @@ def retrieve(query: str, repo: str | None = None, k: int = 5) -> list[dict]:
         kwargs = {'query_embeddings': [qvec], 'n_results': k}
         if repo:
             kwargs['where'] = {'repo': os.path.abspath(repo)}
-        res = COLLECTION.query(**kwargs)
+        res = get_collection().query(**kwargs)
     except Exception as e:
         log.error("retrieval query failed: %s", e)
         return []
@@ -416,7 +436,8 @@ def assemble_context(query: str, repo: str = None, k: int = 10, token_budget: in
     used = 0
 
     for c in chunks:
-        header = f"\n# {c['metadata']['file']} (lines {c['metadata']['start_line']}-{c['metadata']['end_line']})\n"
+        md = c.get('metadata') or {}   # tolerate chunks with missing metadata
+        header = f"\n# {md.get('file', '?')} (lines {md.get('start_line', '?')}-{md.get('end_line', '?')})\n"
         block  = header + c['code']
         cost   = count_tokens(block)
 

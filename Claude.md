@@ -1,59 +1,59 @@
-# Claude's Role in the Autonomous SWE Agent Project
+# Claude Project Context — Autonomous SWE Agent
 
-This document outlines how Claude, the AI assistant, is being used to guide and accelerate the development of the autonomous SWE agent.
+This file gives an AI assistant (Claude) the context it needs to work on this
+repository. Keep it accurate: wrong context is worse than no context.
 
-## Project Guidance
+## What this project is
 
-Claude is acting as a knowledgeable senior engineer providing end-to-end guidance on the 8-week project:
+A production-grade autonomous software engineer: it watches GitHub repos for
+issues and — with no human in the loop — clones the repo, builds a semantic
+understanding of the codebase, drives an LLM through a Reason→Act→Observe
+loop that reads/edits files and runs tests in a hardened Docker sandbox, and
+opens a pull request when it has a verified fix.
 
-- Breaking down the high-level project brief into actionable weekly milestones
-- Explaining key concepts like the ReAct loop, RAG, sandbox security, observability 
-- Recommending specific libraries, tools, and design patterns for each component
-- Providing code samples and scaffolding to jumpstart development
-- Answering conceptual and debugging questions throughout the project
+**`plan2.md` is the single source of truth** — full architecture, decisions,
+current build state, the deep-scan audit, and the build order, all in one
+place. Read it before proposing structural changes. (`plan.md` is the
+superseded v0.1 draft, kept only for history.)
 
-## Code Generation
+## Layout and status
 
-While the core development is done by the human engineer (Nadeem), Claude assists by generating code snippets and templates on demand:
+| Path | What | Status |
+|---|---|---|
+| `agent/retrieval.py` | tree-sitter chunking → sentence-transformers embeddings → ChromaDB | built |
+| `agent/loop.py` | ReAct loop, budget controller, workspace-confined tools | built |
+| `agent/providers/` | `LLMProvider` interface + Anthropic/Gemini adapters | built |
+| `agent/github.py` | stdlib REST client, git helpers (hardened), webhook parsing | built |
+| `agent/sandbox.py` | per-run hardened Docker container for untrusted test execution | built |
+| `docker/sandbox.Dockerfile` | sandbox execution image (pytest pre-baked) | built |
+| `workers/tasks.py` | Celery orchestrator: issue → clone → index → loop → PR | **next (M1)** |
+| `app/main.py` | FastAPI webhook receiver + read API | not started (M3) |
+| `db/`, `monitoring/`, `k8s/`, `helm/` | persistence, observability, deploy | not started |
 
-- Initial versions of tricky components like the Dockerfile, K8s manifests, GitHub Actions CI
-- Idiomatic usage samples for new libraries like tree-sitter, ChromaDB, Celery
-- Starter implementations for complex logic like the budget controller and context assembler
-- Adaptations of reference code to fit the project's specific structure and needs
+## Conventions and invariants (do not break these)
 
-Nadeem then reviews, refines, and integrates these snippets into the production codebase.
+- **Security invariants:** untrusted repo code runs ONLY inside the sandbox
+  (`--network none`, read-only host FS, non-root, resource caps, `.git`
+  masked). Host-side git always runs with hooks/fsmonitor disabled
+  (`_GIT_HARDENING` in `agent/github.py`). Tokens are never persisted to
+  `.git/config` and are redacted from every error/log. No secrets ever enter
+  the sandbox or the system prompt.
+- **Provider-agnostic loop:** `agent/loop.py` imports only
+  `agent.providers.base` types — never a vendor SDK directly.
+- **Fail-soft tools:** tool handlers raise `ToolError` for expected failures;
+  the loop converts them to `is_error` results. A tool must never crash a run.
+- **No new dependencies without cause:** `github.py` is stdlib-only by design;
+  `sandbox.py` shells out to the `docker` CLI deliberately.
+- **Offline self-tests:** every `agent/*.py` module is runnable as
+  `python -m agent.<module>` with no API key / network / daemon and must keep
+  passing. Extend the self-test when you change a module.
+- **Line endings:** internal file I/O normalizes to LF (`_read_text` /
+  `_write_text` in loop.py); `.gitattributes` enforces LF for source files.
 
-## Design & Architecture Advice
+## Working with the author
 
-Claude provides input on key design and architectural decisions:
-
-- Choosing between PaddleOCR vs Claude Vision vs a hybrid approach for invoice extraction
-- Defining the schema and API contract between the backend and frontend 
-- Recommending Prometheus metrics and Grafana dashboard designs
-- Advising on Docker security settings and Kubernetes resource constraints
-- Reviewing and critiquing design docs and ADRs (Architecture Decision Records)
-
-## Pair Programming & Code Review
-
-In pair programming sessions, Claude and Nadeem work together to:
-
-- Reason through hairy issues like cross-group fallback matching in the reconciliation stage
-- Catch bugs like bill number normalization breaking deduplication
-- Refactor complex code into clean abstractions like the `Config` dataclass 
-- Optimize performance bottlenecks identified via profiling
-- Brainstorm edge cases and recommend defensive coding practices
-
-Claude also conducts lightweight code reviews, offering feedback on modularity, readability, error handling, and adherence to language idioms and style guides.
-
-## Documentation & Knowledge Sharing 
-
-Claude assists with writing and refining documentation:
-
-- README.md overviews and "Getting Started" guides 
-- Architecture diagrams and component specs
-- Code comments and docstrings
-- Tutorials and cookbooks illustrating key workflows
-- Evaluation methodologies and benchmark results
-
-This helps make the codebase more understandable and maintainable for Nadeem and future contributors.
-
+Nadeem is a third-year B.Tech student (IIT Bombay) building this as an
+8-week advanced AI-engineering project, targeting ML/AI engineering roles.
+Claude acts as a senior engineer: explain the *why* behind designs, flag
+security and cost implications explicitly, and prefer minimal, verifiable
+changes over large rewrites.

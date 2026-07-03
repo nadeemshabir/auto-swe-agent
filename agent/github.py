@@ -546,12 +546,24 @@ def _redact_token(text: str, token: str | None) -> str:
     return re.sub(r"x-access-token:[^@]+@", "x-access-token:***@", text)
 
 
+# Host-side git must never execute code the repo (or the sandbox that ran the
+# repo's tests) controls. A malicious workspace could carry .git/hooks/* or a
+# core.fsmonitor command in .git/config; either would run ON THE HOST during a
+# plain `git add/commit/push`. These -c overrides neutralize both vectors for
+# every git invocation this module makes (the sandbox additionally masks .git
+# from the container — see agent/sandbox.py — this is defense in depth).
+_GIT_HARDENING = [
+    "-c", "core.hooksPath=/dev/null",   # never run repo-provided hooks
+    "-c", "core.fsmonitor=",            # never run a repo-configured fsmonitor
+]
+
+
 def _git(workspace: str | Path, *args: str, token: str | None = None,
          check: bool = True, timeout: int = _GIT_TIMEOUT) -> subprocess.CompletedProcess:
     """Run a git command inside `workspace`. On failure (when check=True) raises
     GitHubError with the token scrubbed from the message. Returns the completed
     process so callers can inspect returncode/stdout when check=False."""
-    cmd = ["git", "-C", str(workspace), *args]
+    cmd = ["git", *_GIT_HARDENING, "-C", str(workspace), *args]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except FileNotFoundError:
@@ -597,7 +609,8 @@ def clone(repo: str, dest: str | Path, *, token: str | None = None,
         args += ["--branch", base]
     args += [auth_url, str(dest)]
     # Run via a workspace-less git (no -C; the repo does not exist yet).
-    proc = subprocess.run(["git", *args], capture_output=True, text=True, timeout=_GIT_TIMEOUT)
+    proc = subprocess.run(["git", *_GIT_HARDENING, *args],
+                          capture_output=True, text=True, timeout=_GIT_TIMEOUT)
     if proc.returncode != 0:
         detail = _redact_token((proc.stderr or proc.stdout or "").strip(), token)
         raise GitHubError(f"git clone failed (exit {proc.returncode}): {detail}")
@@ -648,7 +661,9 @@ def commit_all(workspace: str | Path, message: str) -> bool:
     staged = _git(workspace, "diff", "--cached", "--quiet", check=False)
     if staged.returncode == 0:
         return False
-    _git(workspace, "commit", "-m", message)
+    # --no-verify is belt-and-braces on top of _GIT_HARDENING's hooksPath
+    # override: agent commits must never trigger repo-controlled hook code.
+    _git(workspace, "commit", "--no-verify", "-m", message)
     return True
 
 

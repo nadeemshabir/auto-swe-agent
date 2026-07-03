@@ -123,12 +123,16 @@ class Budget:
 # ═════════════════════════════════════════════════════════════════════════════
 # Tools — all file access confined to the workspace
 # ═════════════════════════════════════════════════════════════════════════════
- #didn't understood why we exactly need this ToolError Exception class
- # if the tool fails it will return error message and if it fails again then we will stop the loop
- # correct me if i am wrong
 class ToolError(Exception):
     """A recoverable tool failure. Surfaced to the model as is_error, not raised
-    out of the loop."""
+    out of the loop.
+
+    Why a dedicated class: tool handlers need to distinguish an *expected*
+    failure (bad path, file missing, ambiguous edit — things the model can see
+    and correct on its next turn) from an *unexpected* bug in the tool itself.
+    _dispatch() turns ToolError into a normal is_error result, while any other
+    exception is logged as a tool bug. The loop never stops on a tool failure —
+    only budgets, completion, refusal, or a provider error end a run."""
 
 #makes sure LLM can't access files outside the workspace/repo
 def _safe_path(workspace: Path, p: str | None) -> Path:
@@ -154,9 +158,6 @@ def _clip(text: str, limit: int) -> str:
         return text
     return text[:limit] + f"\n... [truncated to first {limit} chars]"
 
-# why we exactly need this why not we use the read_text directly?
-# 
-
 def _read_text(path: Path) -> str:
     """Read as UTF-8 with newlines normalized to LF. Uses read_bytes (not
     read_text) so the OS never rewrites line endings — the model always sees
@@ -178,17 +179,21 @@ def _load_retrieval():
     return retrieval
 
 
-def default_tools(workspace: Path) -> dict[str, tuple[ToolSpec, "callable"]]:
+def default_tools(workspace: Path, sandbox=None) -> dict[str, tuple[ToolSpec, "callable"]]:
     """Build the default tool set bound to `workspace`.
     Returns name -> (spec, handler). A handler takes the model's args dict and
-    returns a string, or raises ToolError."""
+    returns a string, or raises ToolError.
 
-    #retrieve context tool - semantic search, this is where the context is retrieved from the codebase
-    # it takes query and k as arguments
-    # it returns the context in the form of string
-    # k is optional and it defaults to 8, number of chunks extracted
-    # it uses openai embeddings to get the context
-    # it uses chromaDB to store and retrieve the context
+    If `sandbox` (an agent.sandbox.Sandbox) is given, `run_tests` is dispatched
+    into the hardened container instead of running on the host — the only piece
+    that executes untrusted repo code. Everything else (retrieval, reads, edits,
+    listing) stays host-side against the workspace, as designed."""
+
+    # retrieve_context — semantic search over the indexed codebase.
+    # Takes `query` (required) and `k` (optional, default 8 = max chunks).
+    # Embeds the query with the local sentence-transformers model (no API
+    # call, no network) and searches the ChromaDB vector store; returns a
+    # token-budgeted context string (see agent/retrieval.py).
     def retrieve_context(args: dict) -> str:
         query = args.get("query")
         if not query:
@@ -288,6 +293,20 @@ def default_tools(workspace: Path) -> dict[str, tuple[ToolSpec, "callable"]]:
     # target is optional and it defaults to ""
     def run_tests(args: dict) -> str:
         target = args.get("target") or ""
+
+        # Sandboxed path: dispatch into the isolated container (untrusted code).
+        if sandbox is not None:
+            try:
+                from .sandbox import SandboxError
+            except ImportError:
+                from agent.sandbox import SandboxError
+            try:
+                return sandbox.run_tests(target or None)
+            except SandboxError as e:
+                # a sandbox/daemon failure is a recoverable tool error — the
+                # model sees it and can adapt (plan §9).
+                raise ToolError(f"sandbox error: {e}")
+
         target_arg = str(_safe_path(workspace, target)) if target else str(workspace)
 
         # Use the workspace's own venv Python if it exists, so tests run
@@ -453,6 +472,7 @@ class ReActAgent:
         tools: dict | None = None,
         max_output_tokens: int = 8_192,
         auto_index: bool = False,
+        sandbox=None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         if not self.workspace.is_dir():
@@ -461,10 +481,11 @@ class ReActAgent:
         self.budget = budget or Budget()
         self.system = system or DEFAULT_SYSTEM
         self.max_output_tokens = max_output_tokens
-        self.tools = tools or default_tools(self.workspace)
+        self.tools = tools or default_tools(self.workspace, sandbox=sandbox)
         self._specs = [spec for spec, _ in self.tools.values()]
-        self._auto_index = auto_index 
-        #indexing: embedding the file contents using OpenAI and storing them in the vector database
+        # auto_index: parse + embed the workspace (local sentence-transformers
+        # model) into ChromaDB before the run, so retrieve_context has data.
+        self._auto_index = auto_index
 
     # ── tool dispatch ─────────────────────────────────────────────────────────
     #tool dispatch: a function that takes a tool call and returns the result of the tool call
@@ -641,8 +662,15 @@ def _main(argv: list[str]) -> int:
     p.add_argument("task", nargs="?", help="The task / issue text. Omit for an offline self-test.")
     p.add_argument("--workspace", default=".", help="Repo to work in (default: cwd).")
     p.add_argument("--auto-index", action="store_true", help="Index the repo before running.")
-    p.add_argument("--max-steps", type=int, default=30)
-    p.add_argument("--max-usd", type=float, default=5.0)
+    p.add_argument("--sandbox", action="store_true",
+                   help="Run tests inside a hardened Docker container (needs a running daemon).")
+    p.add_argument("--sandbox-image", default=None, help="Override SANDBOX_IMAGE for this run.")
+    # default=None so an unset flag falls through to Budget's .env-driven
+    # defaults (MAX_STEPS / MAX_USD) instead of silently overriding them.
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="Cap on model calls (default: MAX_STEPS env or 30).")
+    p.add_argument("--max-usd", type=float, default=None,
+                   help="Cap on USD spend (default: MAX_USD env or 5.0).")
     args = p.parse_args(argv)
 
     if not args.task:
@@ -650,17 +678,46 @@ def _main(argv: list[str]) -> int:
         return 0
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    # Optional hardened sandbox for test execution. Started once, reused for the
+    # whole run (DECISION D6), torn down in the finally.
+    sandbox = None
+    if args.sandbox:
+        try:
+            from .sandbox import Sandbox, SandboxError, docker_available
+        except ImportError:
+            from agent.sandbox import Sandbox, SandboxError, docker_available
+        if not docker_available():
+            print("error: --sandbox given but the Docker daemon is not reachable.", file=sys.stderr)
+            return 1
+        try:
+            sandbox = Sandbox(args.workspace, image=args.sandbox_image)
+            sandbox.start()
+        except SandboxError as e:
+            print(f"error: could not start sandbox: {e}", file=sys.stderr)
+            return 1
+
+    budget_overrides = {}
+    if args.max_steps is not None:
+        budget_overrides["max_steps"] = args.max_steps
+    if args.max_usd is not None:
+        budget_overrides["max_usd"] = args.max_usd
+
     try:
         result = run(
             args.task,
             workspace=args.workspace,
             auto_index=args.auto_index,
-            budget=Budget(max_steps=args.max_steps, max_usd=args.max_usd),
+            budget=Budget(**budget_overrides),
+            sandbox=sandbox,
         )
     except (ProviderError, ValueError) as e:
         # e.g. missing SDK / API key, or a bad workspace path
         print(f"error: {e}", file=sys.stderr)
         return 1
+    finally:
+        if sandbox is not None:
+            sandbox.close()
     print("\n" + "=" * 70)
     print(result.summary())
     print("=" * 70)

@@ -1,5 +1,10 @@
 # Autonomous SWE Agent — Master Plan (Source of Truth)
 
+> ⚠️ **SUPERSEDED (2026-07-02).** This is the historical v0.1 draft. The active
+> single source of truth is now **`plan2.md`**, which absorbs everything below,
+> updates it to the real build state, and folds in the deep-scan audit. Read
+> `plan2.md` instead. This file is kept only for history.
+
 > **Status:** DRAFT for review · **Version:** 0.1 · **Date:** 2026-06-28 · **Owner:** Nadeem
 > **Scope of this document:** the complete backend system — issue intake → codebase understanding → reasoning → sandboxed execution → pull request — plus data, models, security, observability, and deployment. **The web frontend is explicitly out of scope here** (a thin read-only dashboard over the API documented in §3; its internals are a separate document).
 >
