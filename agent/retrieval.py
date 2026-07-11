@@ -108,10 +108,39 @@ def count_tokens(text: str) -> int:
 # ───────────────────────────────────────────────────────────────────────────
 
 def walk_py_files(root: str):
-    """Yield paths of every .py file under `root`, skipping junk folders."""
-    SKIP = {'.venv', '__pycache__', '.git', 'node_modules', '.chroma', '.embedding_cache'}
+    """Yield paths of every .py file under `root`, skipping junk folders.
+
+    Two-layer skip strategy:
+    1. Static name blocklist — covers all common naming conventions for
+       virtual environments, build artifacts, caches, and VCS metadata.
+    2. Dynamic pyvenv.cfg check — any directory containing this file IS a
+       Python virtual environment, regardless of its name (e.g. `myenv`,
+       `.venv2`, `py312`). This catches custom-named venvs that the static
+       list cannot anticipate.
+    """
+    # Well-known junk folder names to always skip
+    SKIP_NAMES = {
+        # Virtual environments — all common naming conventions
+        '.venv', 'venv', 'env', '.env', 'virtualenv', '.virtualenv',
+        # Python build / distribution artifacts
+        '__pycache__', 'dist', 'build', '.eggs', 'eggs',
+        # VCS metadata
+        '.git', '.hg', '.svn',
+        # Common tool caches
+        '.mypy_cache', '.pytest_cache', '.ruff_cache', '.tox', 'htmlcov',
+        # JS / frontend (repos may have both Python and JS)
+        'node_modules',
+        # This project's own data directories
+        '.chroma', '.embedding_cache',
+    }
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP]
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in SKIP_NAMES
+            # Dynamic check: skip any folder that IS a Python venv,
+            # no matter what it's named (pyvenv.cfg is the canonical marker).
+            and not os.path.exists(os.path.join(dirpath, d, 'pyvenv.cfg'))
+        ]
         for fname in filenames:
             if fname.endswith('.py'):
                 yield os.path.join(dirpath, fname)
@@ -270,6 +299,8 @@ def embed_many(codes: list[str]) -> list[list[float]]:
         misses.append((i, code, cache_file))
 
     if misses:
+        log.info("  embedding %d new chunk(s) (cache hits: %d)...",
+                 len(misses), len(codes) - len(misses))
         try:
             encoded = get_embedder().encode([c for _, c, _ in misses])
         except Exception as e:
@@ -305,16 +336,22 @@ def index_repo(root: str):
     n_errors = 0
     collection = get_collection()
 
-    for fpath in walk_py_files(root):
+    all_files = list(walk_py_files(root))
+    n_files = len(all_files)
+    log.info("Found %d Python file(s) to index under %s", n_files, root)
+
+    for file_idx, fpath in enumerate(all_files, start=1):
         # Normalize to an absolute path. Chunk IDs and the delete-by-file
         # filter are keyed on this string — if the same repo were indexed via
         # a relative path once and an absolute path later, the forms would not
         # match and stale duplicate chunks would survive re-indexing (and two
         # different repos indexed relatively could even collide).
         fpath = os.path.abspath(fpath)
+        log.info("[%d/%d] indexing %s", file_idx, n_files, fpath)
         try:
             chunks = parse_file(fpath)
             if not chunks:
+                log.info("  → no chunks extracted, skipping")
                 continue
 
             # drop any stale chunks from a previous index of this file
@@ -457,6 +494,15 @@ def assemble_context(query: str, repo: str = None, k: int = 10, token_budget: in
 if __name__ == '__main__':
     import sys
 
+    # Configure logging so that all log.info / log.warning messages are
+    # printed to the terminal during a smoke-test run. Without this, every
+    # log call is silently dropped because no handler is attached.
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s  %(message)s',
+        datefmt='%H:%M:%S',
+    )
+
     test_repo = sys.argv[1] if len(sys.argv) > 1 else str(BASE_DIR.parent)
 
     print(f"\n=== INDEXING {test_repo} ===")
@@ -465,9 +511,8 @@ if __name__ == '__main__':
 
     print("=== RETRIEVAL TEST ===")
     queries = [
-        "function that adds two numbers",
-        "how to read a file from disk",
-        "class for arithmetic operations",
+        "function for extracting proofs",
+        "how to handle rate diff problem"
     ]
     for q in queries:
         print(f"\n🔍 Query: {q!r}")
