@@ -14,22 +14,34 @@ Mapping to the provider-neutral interface (agent/providers/base.py):
     count_tokens()        -> client.models.count_tokens(...).total_tokens
 
 Credentials resolve from GEMINI_API_KEY (or GOOGLE_API_KEY). Model defaults to
-gemini-2.5-pro; override with $LLM_MODEL. Verify the exact model id is current
+gemini-3.5-flash; override with $LLM_MODEL. Verify the exact model id is current
 for your account — Gemini model names change often.
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import time
 
 from .base import LLMResponse, ProviderError, ToolCall, ToolSpec, Usage
+
+log = logging.getLogger("agent.providers.gemini")
+
+# Retry settings for transient API errors (503, 429, etc.)
+_MAX_RETRIES = 5
+_RETRY_BASE_DELAY = 1.0  # seconds; doubles each attempt (1, 2, 4, 8, 16)
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
 
 
 # Approximate input / output price per 1M tokens, for the budget USD cap only.
 PRICING: dict[str, tuple[float, float]] = {
-    "gemini-2.5-pro":   (1.25, 10.0),
-    "gemini-2.5-flash": (0.30, 2.50),
-    "gemini-2.0-flash": (0.10, 0.40),
+    "gemini-3.5-flash":    (0.30, 2.50),
+    "gemini-3.1-pro":      (1.25, 10.0),
+    "gemini-3.1-flash-lite": (0.10, 0.40),
+    # legacy (may still work for some accounts)
+    "gemini-2.5-pro":      (1.25, 10.0),
+    "gemini-2.5-flash":    (0.30, 2.50),
 }
 
 
@@ -50,7 +62,7 @@ class GeminiProvider:
 
         self._genai = genai
         self._types = types
-        self.model = model or os.getenv("LLM_MODEL", "gemini-2.5-pro")
+        self.model = model or os.getenv("LLM_MODEL", "gemini-3.5-flash")
         try:
             # Client() resolves GEMINI_API_KEY / GOOGLE_API_KEY from the env.
             self.client = genai.Client()
@@ -78,12 +90,26 @@ class GeminiProvider:
         except Exception as e:
             raise ProviderError(f"could not build Gemini request: {e}") from e
 
-        try:
-            resp = self.client.models.generate_content(
-                model=self.model, contents=messages, config=config,
-            )
-        except Exception as e:
-            raise ProviderError(f"Gemini API error: {e}") from e
+        last_err = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                resp = self.client.models.generate_content(
+                    model=self.model, contents=messages, config=config,
+                )
+                break  # success
+            except Exception as e:
+                last_err = e
+                # Check if the error contains a retryable HTTP status code.
+                err_str = str(e)
+                retryable = any(str(code) in err_str for code in _RETRYABLE_STATUS_CODES)
+                if not retryable or attempt == _MAX_RETRIES:
+                    raise ProviderError(f"Gemini API error: {e}") from e
+                delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                log.warning(
+                    "Gemini transient error (attempt %d/%d), retrying in %.1fs: %s",
+                    attempt + 1, _MAX_RETRIES, delay, e,
+                )
+                time.sleep(delay)
 
         try:
             candidate = (resp.candidates or [None])[0]

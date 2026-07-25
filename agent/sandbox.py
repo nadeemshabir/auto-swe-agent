@@ -81,7 +81,13 @@ def _default_user() -> str:
         return env
     getuid = getattr(os, "getuid", None)
     if getuid is not None:  # POSIX host
-        return f"{os.getuid()}:{os.getgid()}"
+        uid, gid = os.getuid(), os.getgid()
+        if uid == 0:
+            # Host is root (common in WSL). Mapping root into the container
+            # would defeat the non-root isolation guarantee. Fall back to the
+            # unprivileged nobody user instead.
+            return "65534:65534"
+        return f"{uid}:{gid}"
     return "65534:65534"    # Windows/macOS
 
 
@@ -210,6 +216,13 @@ class Sandbox:
     def start(self) -> "Sandbox":
         if self.container_id is not None:
             return self  # already started
+
+        # If the container user differs from the workspace owner (e.g. host is
+        # root in WSL, container is nobody/65534), the bind-mounted workspace
+        # won't be writable. Make it world-writable before starting — the
+        # workspace is a per-run throwaway dir, so this is safe.
+        self._ensure_workspace_writable()
+
         try:
             proc = subprocess.run(
                 self._run_args(), capture_output=True, text=True,
@@ -230,6 +243,27 @@ class Sandbox:
         if not self._has_timeout:
             log.warning("image %s lacks coreutils `timeout`; relying on outer kill only", self.image)
         return self
+
+    def _ensure_workspace_writable(self) -> None:
+        """Make the workspace tree writable by the container user.
+
+        When the host process is root (common in WSL) and the container runs as
+        nobody (65534), the bind-mounted workspace files are owned by root and
+        unwritable by the container. We chmod o+rwX so the unprivileged
+        container user can create/edit files. This is safe: the workspace is a
+        per-run throwaway directory that gets deleted after the run."""
+        try:
+            container_uid = self.user.split(":")[0]
+            host_uid = str(os.getuid()) if hasattr(os, "getuid") else "?"
+            if container_uid != host_uid:
+                log.info("sandbox: host uid=%s ≠ container uid=%s — making workspace world-writable",
+                         host_uid, container_uid)
+                subprocess.run(
+                    ["chmod", "-R", "a+rwX", str(self.workspace)],
+                    capture_output=True, timeout=30,
+                )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            log.warning("sandbox: could not chmod workspace: %s", e)
 
     def close(self) -> None:
         """Force-remove the container. Safe to call repeatedly."""

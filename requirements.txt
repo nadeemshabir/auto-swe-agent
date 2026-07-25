@@ -21,3 +21,17 @@ pytest                     # used by the agent's run_tests tool
 # agent/github.py deliberately adds NO dependency: the REST client is pure
 # stdlib (urllib), and git operations shell out to the `git` CLI. It only needs
 # `git` on PATH and GITHUB_TOKEN in the environment for live calls.
+
+# --- M1: Queue & workers ---
+celery>=5.3
+redis>=5.0
+
+# --- M3: API gateway ---
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx                      # needed by FastAPI's TestClient for self-tests
+
+# --- M4: Persistence & idempotency ---
+sqlalchemy>=2.0
+alembic>=1.13
+psycopg2-binary>=2.9       # PostgreSQL driver

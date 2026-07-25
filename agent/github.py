@@ -115,7 +115,7 @@ class GitHubError(Exception):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Value objects
+# Value objectsA Value Object is just a clean, typed container for data. Instead of passing messy dictionaries of raw API responses around our code, we convert them into strict objects (like Issue and PullRequest). This makes the code safer, prevents typos, and gives us auto-complete in our code editors
 # ═════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -133,7 +133,8 @@ class Issue:
     html_url: str = ""
 
     @classmethod
-    def from_api(cls, data: dict, repo: str) -> "Issue":
+    #The Conversion helper (from_api): This is a function that takes the messy API dictionary, cleans it up (e.g., stripping spaces), and extracts only the fields we care about.
+    def from_api(cls, data: dict, repo: str) -> "Issue": 
         if not isinstance(data, dict):
             raise GitHubError("issue payload is not an object")
         labels = [
@@ -189,6 +190,9 @@ class PullRequest:
 
 # ═════════════════════════════════════════════════════════════════════════════
 # HTTP transport (injectable so the client is testable offline)
+# _RawResponse: Just a neat box to hold GitHub's reply, with the headers lowercased to make reading them easier later.
+# _TransportError (Exception): Used strictly when the internet/system fails entirely (like if your cable is unplugged) before GitHub even gets the message.
+# _urllib_transport: The actual engine room where Python physically reaches out and touches GitHub's servers over the internet.
 # ═════════════════════════════════════════════════════════════════════════════
 
 @dataclass
