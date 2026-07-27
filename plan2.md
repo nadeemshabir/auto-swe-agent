@@ -729,5 +729,134 @@ overridable per-run via `--max-steps` / `--max-usd`. Model + effort:
 
 ---
 
+## 21. Deployment Roadmap (Cloud)
+
+> This section was added after the core agent (M1–M4) was verified working
+> end-to-end locally, including the full Docker Compose stack. Cloud was
+> deliberately deferred until the product itself was proven.
+> **Follow the phases in order — each one is a hard prerequisite for the next.**
+
+---
+
+### Phase 0 — Prove the agent works (before touching cloud at all)
+*Goal: validate the core product, not the infrastructure.*
+
+- Run `docker-compose up` locally.
+- `ngrok http 8000`, register that URL as a real GitHub webhook on a low-stakes
+  test repo (set `GITHUB_WEBHOOK_SECRET` in `.env`).
+- Open 5–10 real issues of varying difficulty; watch what the agent produces.
+- **Do not move to Phase 1 until the agent resolves issues reliably.**
+- Learning focus: none — this is a checkpoint, not a lesson.
+
+---
+
+### Phase 1 — Close the two gaps before anything goes public
+*Goal: don't put a costly, unsecured endpoint on the internet.*
+
+1. **Auth on `POST /runs`** — add a shared-secret header check so the manual
+   trigger endpoint can't be abused by anyone who finds the URL.
+2. **Sandbox-in-cloud research (DECISION D10)** — Azure Container Apps (Phase 2)
+   does not give you host Docker socket access the way your laptop does.
+   Options to evaluate:
+   - **Rootless Docker-in-Docker** inside the worker container.
+   - **Restructure sandbox:** replace the Docker-based sandbox with a
+     subprocess-level sandbox (e.g. `nsjail`, `bubblewrap`) that doesn't need
+     a Docker daemon at all.
+   - **Accept the risk temporarily:** run without sandbox on cloud (tests run on
+     host), re-add sandbox in Phase 4 when AKS gives you more control.
+   - Whichever you pick, document the decision here and update `agent/sandbox.py`.
+- Learning focus: application-level security basics; why "works on my laptop"
+  Docker patterns (host socket) don't survive contact with real cloud platforms.
+
+---
+
+### Phase 2 — First real deployment: Azure Container Apps
+*Goal: get live on a stable URL, smallest possible new-concept surface area.*
+
+**Why Azure Container Apps, not raw VMs or Kubernetes:**
+Container Apps is PaaS (Platform as a Service) — you hand it a container image
+and it handles the server, networking, and scaling. No Kubernetes concepts needed
+yet. It's the fastest path from "works locally" to "running unattended in the cloud."
+
+Steps:
+1. Push the 3 images (`api`, `worker`, `sandbox`) to **Azure Container Registry
+   (ACR)** — first time using a real image registry instead of local Docker.
+2. Provision **Azure Database for PostgreSQL** (Flexible Server, managed — you
+   don't run it yourself) and **Azure Cache for Redis**.
+3. Deploy `api` and `worker` as two separate Container Apps, wired to the managed
+   DB and Redis via environment variables / Azure Key Vault secrets.
+4. Point the real GitHub webhook at your Azure URL (retire ngrok).
+5. Let the system run **unattended** for a few days on your test repo.
+- Learning focus: container registries, managed databases, env vars / secrets in
+  a cloud platform, what "PaaS" means as a middle ground between raw VMs and K8s.
+
+---
+
+### Phase 3 — Add real observability (this is M5, now it is earned)
+*Goal: know when it breaks, not just that it might.*
+
+- Start with **Azure Container Apps built-in logs and metrics** before standing up
+  a self-hosted Prometheus + Grafana stack — the built-ins answer 80 % of
+  questions with zero setup.
+- Add **one real alert** (e.g. "notify me if a run fails or costs > $1") — this
+  is the first time dashboards actually matter, because now there is real
+  unattended traffic to watch.
+- Once the built-in metrics feel limiting, graduate to:
+  - Prometheus metrics endpoint in `app/main.py` and `workers/tasks.py`.
+  - Grafana dashboard wired to Prometheus.
+  - OpenTelemetry traces so you can see where time is spent per run (clone vs
+    index vs LLM calls vs git push).
+- This maps to the `monitoring/` directory already in the project.
+- Learning focus: the difference between logs, metrics, and traces; what
+  "observability" means in practice vs. in a slide deck.
+
+---
+
+### Phase 4 — Learn real Kubernetes deliberately, as its own project
+*Goal: learn Helm/K8s properly — not bolted onto a deployment deadline.*
+
+- Take the now-proven, now-live system and **migrate** it from Container Apps to
+  **AKS (Azure Kubernetes Service)** — same Azure subscription, same workload.
+- Because the system already works on Container Apps, this becomes a **learning
+  exercise with a safety net** — if AKS setup goes sideways, Container Apps is
+  still running in the background.
+- This is where the `k8s/` and `helm/` directories in the project get built for
+  real: Deployments, Services, Ingress, ConfigMaps, Secrets, HPA (autoscaling).
+- The sandbox-in-cloud problem (D10) is also easier to solve here: AKS gives you
+  the ability to mount the Docker socket on specific node pools, or use
+  DinD (Docker-in-Docker) sidecar patterns that Container Apps doesn't support.
+- Learning focus: Kubernetes concepts for real — not tutorial YAML, but running
+  your actual system.
+
+---
+
+### Phase 5 — CI/CD
+*Goal: stop deploying by hand.*
+
+- GitHub Actions pipeline:
+  1. `lint` + `pytest` (self-tests, no API keys needed).
+  2. `docker build` for all 3 images.
+  3. Push to ACR.
+  4. `kubectl rollout` / `helm upgrade` to AKS.
+- Every `git push` to `main` automatically deploys to production.
+- Learning focus: the full loop from `git push` to live deployment, automated.
+
+---
+
+### Why this order
+
+| Skip | Risk |
+|---|---|
+| Skipping Phase 0 | You pay cloud bills to debug a broken product |
+| Skipping Phase 1 | Your `POST /runs` endpoint is publicly abusable the moment ngrok runs |
+| Going to K8s before Phase 2 | You stack two hard unknowns ("does the agent work?" + "how does K8s work?") at the same time — this is how projects stall |
+| Adding observability before Phase 2 | You build dashboards with no real traffic to watch |
+
+Phase 4 is where the deep Kubernetes learning happens — but only after something
+is already working and live, so you are learning K8s deliberately, not
+desperately debugging it while also trying to ship.
+
+---
+
 *End of the source of truth. Every `[DECISION]` in §16 is open for your call;
 any section can be revised on request (bump the version in §0).*

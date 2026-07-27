@@ -1,0 +1,216 @@
+# docker-compose.yml
+# Wires all containers together for local development and staging deployments.
+#
+# Services:
+#   postgres   — PostgreSQL 16 (persistent run data + step traces)
+#   redis      — Redis 7 (Celery broker + result backend)
+#   api        — FastAPI gateway (webhook receiver + read API)
+#   worker     — Celery worker (clone → index → ReAct → PR)
+#   migrate    — one-shot Alembic migration runner (runs then exits)
+#
+# Usage:
+#   # 1. Build images and start everything (first time):
+#   docker-compose up --build
+#
+#   # 2. Start without rebuilding:
+#   docker-compose up
+#
+#   # 3. Scale workers to handle more issues in parallel:
+#   docker-compose up --scale worker=3
+#
+#   # 4. Tear everything down (keep volumes = keep DB data):
+#   docker-compose down
+#
+#   # 5. Tear down AND wipe all data (fresh start):
+#   docker-compose down -v
+
+version: "3.9"
+
+# ── Shared environment ────────────────────────────────────────────────────────
+# These variables are injected into every service that uses x-agent-env.
+# Docker Compose reads your .env file automatically from the project root.
+x-agent-env: &agent-env
+  # ── LLM Provider ──────────────────────────────────────────────────────────
+  LLM_PROVIDER: ${LLM_PROVIDER:-gemini}
+  LLM_MODEL: ${LLM_MODEL:-gemini-3.5-flash}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+
+  # ── GitHub ────────────────────────────────────────────────────────────────
+  GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+  GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+
+  # ── Budget ────────────────────────────────────────────────────────────────
+  MAX_STEPS: ${MAX_STEPS:-30}
+  MAX_USD: ${MAX_USD:-5.0}
+  MAX_TOTAL_TOKENS: ${MAX_TOTAL_TOKENS:-500000}
+  MAX_WALLCLOCK_S: ${MAX_WALLCLOCK_S:-1800}
+  COMMENT_ON_START: ${COMMENT_ON_START:-true}
+
+  # ── Infrastructure ────────────────────────────────────────────────────────
+  # NOTE: these point to the Docker service names, NOT localhost!
+  # Inside the Docker network, 'redis' and 'postgres' are the hostnames.
+  REDIS_URL: redis://redis:6379/0
+  DATABASE_URL: postgresql://agent:agent@postgres:5432/auto_swe_agent
+
+  # ── Sandbox ───────────────────────────────────────────────────────────────
+  SANDBOX_IMAGE: ${SANDBOX_IMAGE:-auto-swe-sandbox:latest}
+  WORKSPACE_ROOT: /var/agent/workspaces
+
+  # ── API ───────────────────────────────────────────────────────────────────
+  MAX_WEBHOOK_BODY_BYTES: ${MAX_WEBHOOK_BODY_BYTES:-1048576}
+
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    # Persists PostgreSQL data across container restarts.
+    # Without this, every `docker-compose down` would wipe your run history.
+  redis_data:
+    # Persists Redis data so in-flight tasks survive a Redis restart.
+  agent_workspaces:
+    # Shared volume between the host and worker containers.
+    # Agent clones repos here; bind-mounting gives visibility from the host.
+
+
+# ── Network ───────────────────────────────────────────────────────────────────
+networks:
+  agent_net:
+    # All services share this private bridge network.
+    # The API and Worker can reach postgres/redis by service name.
+    # Nothing outside this Compose stack can reach postgres or redis directly.
+    driver: bridge
+
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: auto-swe-postgres
+    restart: unless-stopped
+    networks:
+      - agent_net
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent
+      POSTGRES_DB: auto_swe_agent
+    ports:
+      # Expose to host so you can run `psql` directly for debugging.
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d auto_swe_agent"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: auto-swe-redis
+    restart: unless-stopped
+    networks:
+      - agent_net
+    volumes:
+      - redis_data:/data
+    # Persist the queue to disk so tasks survive a Redis restart.
+    command: redis-server --save 60 1 --loglevel warning
+    ports:
+      # Expose to host for debugging with `redis-cli`.
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+
+  # ── Alembic migrations (one-shot) ───────────────────────────────────────────
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    container_name: auto-swe-migrate
+    networks:
+      - agent_net
+    environment:
+      <<: *agent-env
+    # Run once and exit. The `api` and `worker` services wait for this.
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Restart policy: never — this is a one-shot init container.
+    restart: "no"
+
+
+  # ── FastAPI Gateway ──────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    container_name: auto-swe-api
+    restart: unless-stopped
+    networks:
+      - agent_net
+    environment:
+      <<: *agent-env
+    ports:
+      # The public port GitHub webhooks point to.
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+
+  # ── Celery Worker ────────────────────────────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    container_name: auto-swe-worker
+    restart: unless-stopped
+    networks:
+      - agent_net
+    environment:
+      <<: *agent-env
+      # PYTHONPATH must include /app so `from agent.xxx import` resolves.
+      PYTHONPATH: /app
+    volumes:
+      # Mount the Docker socket so the worker can spin up sandbox containers.
+      # In production, use a dedicated socket with tighter ACLs.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Shared workspace volume — cloned repos land here.
+      - agent_workspaces:/var/agent/workspaces
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # Override the CMD to also set PYTHONPATH inline (belt + braces).
+    command:
+      - "celery"
+      - "-A"
+      - "workers"
+      - "worker"
+      - "--loglevel=info"
+      - "--concurrency=2"
+      - "--max-tasks-per-child=10"
