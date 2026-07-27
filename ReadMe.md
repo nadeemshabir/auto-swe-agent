@@ -44,38 +44,47 @@ The system has six layers, each independently testable and deployable:
 
 ## Status
 
-By component (built out of strict week order):
+By component:
 
 - **Environment setup:** Done ✅
 - **Codebase understanding** (`agent/retrieval.py`): Done ✅ — tree-sitter chunking, embeddings, ChromaDB, call graph, token-budgeted context
-- **ReAct reasoning loop** (`agent/loop.py` + `agent/providers/`): Core done ✅ — manual agentic loop, budget controller, sandboxed tools, pluggable Anthropic/Gemini providers
-- **GitHub integration** (`agent/github.py`): Done ✅ — stdlib REST client (rate-limit + transient-failure retries, idempotent PR creation), git helpers (token never persisted/leaked), webhook→issue parsing, offline self-test
-- **Docker sandbox** (`agent/sandbox.py`): Done ✅ — hardened per-run container (`--network none`, read-only host FS, writable workspace mount only, non-root, `--cap-drop ALL` + no-new-privileges, pids/memory/cpu caps, in-container + outer wall-clock kill); shells out to the `docker` CLI (no new dependency); loop-swappable `run_tests` that routes untrusted test execution into the container; `docker/sandbox.Dockerfile` pre-bakes pytest; offline-safe self-test
-- **Backend & queue** (`app/`, `workers/`): Not started
-- **Observability & deployment** (`monitoring/`, `k8s/`, `helm/`): Not started
+- **ReAct reasoning loop** (`agent/loop.py` + `agent/providers/`): Done ✅ — multi-step loop, budget controller, sandboxed tools, pluggable Anthropic/Gemini (`gemini-3.5-flash`) providers
+- **GitHub integration** (`agent/github.py`): Done ✅ — REST client with rate-limiting backoff, HMAC signature verification, idempotent PR creation, webhook event ingestion
+- **Docker sandbox** (`agent/sandbox.py`): Done ✅ — hardened per-run container (`--network none`, read-only host FS, resource caps, pytest integration)
+- **Backend & queue** (`app/`, `workers/`, `db/`): Done ✅ — FastAPI web gateway, Celery distributed task queue, Redis broker, PostgreSQL database state tracking with Alembic migrations
+- **Docker Compose & Webhook Tunneling:** Done ✅ — full multi-container local production environment exposed via ngrok for automated end-to-end GitHub issue processing
+- **Observability & cloud deployment** (`monitoring/`, `k8s/`, `helm/`): In progress ⏳ (Phase 1-2 cloud deployment roadmap established)
 
-## Usage
+## Quick Start (Docker Compose & Webhooks)
+
+```bash
+# 1. Clone & create environment file
+cp .env.example .env
+# Edit .env and set GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET, and GEMINI_API_KEY / ANTHROPIC_API_KEY
+
+# 2. Start the multi-container stack (API, Worker, Redis, Postgres, DB Migrations)
+docker-compose up --build
+
+# 3. Expose local API gateway to GitHub via ngrok
+ngrok http 8000
+
+# 4. Add Webhook to your GitHub Repo
+# Payload URL: https://<your-ngrok-domain>.ngrok-free.dev/webhooks/github
+# Content type: application/json
+# Secret: <your GITHUB_WEBHOOK_SECRET>
+# Events: Issues
+
+# 5. Open an issue on GitHub — the agent will autonomously solve it and submit a PR!
+```
+
+### Manual CLI Usage
 
 ```bash
 # 1. Install dependencies (into your virtual environment)
 pip install -r requirements.txt
 
-# 2. Verify the agent's tools and safety guards — no API key or model needed
-python -m agent.loop
-
-# 3. Pick a provider and set its key in .env
-#    ANTHROPIC_API_KEY=...                       # default provider (claude-opus-4-8)
-#    GEMINI_API_KEY=...   with LLM_PROVIDER=gemini  # alternative (gemini-2.5-pro)
-
-# 4. Run the agent on a real task against a repo (indexes it first)
+# 2. Run the agent directly on a task against a local repo
 python -m agent.loop "Fix the off-by-one in paginate()" --workspace /path/to/repo --auto-index
-
-# 5. (Optional) run the untrusted test suite inside a hardened Docker sandbox
-#    Needs a running Docker daemon. Bake pytest + repo deps into the image first:
-docker build -f docker/sandbox.Dockerfile -t auto-swe-sandbox:latest .
-python -m agent.sandbox                       # verify isolation (network/FS/user/timeout)
-SANDBOX_IMAGE=auto-swe-sandbox:latest \
-  python -m agent.loop "Fix ..." --workspace /path/to/repo --auto-index --sandbox
 ```
 
 The model and effort are configurable via env vars (`LLM_PROVIDER`, `LLM_MODEL`,
