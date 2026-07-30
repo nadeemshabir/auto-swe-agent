@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -72,10 +73,11 @@ def _persist_run(session, run_db):
             pass
 
 
-def _persist_step(session, run_id, step_n, step_data):
+def _persist_step(session, run_id, step_n, step_data, agent_name: str = "coder"):
     """Write one ReAct step to the run_steps table (incremental).
 
     Called after each agent step so a crashed run still has partial trace.
+    agent_name tags the row as 'planner', 'coder', or 'reviewer'.
     """
     try:
         from db.models import RunStep
@@ -94,6 +96,7 @@ def _persist_step(session, run_id, step_n, step_data):
         step = RunStep(
             run_id=run_id,
             n=step_n,
+            agent_name=agent_name,
             stop_reason=step_data.get("stop_reason"),
             text=(step_data.get("text") or "")[:5000],
             input_tokens=step_data.get("input_tokens", 0),
@@ -108,6 +111,35 @@ def _persist_step(session, run_id, step_n, step_data):
             session.rollback()
         except Exception:
             pass
+
+
+def _persist_agent_step(session, run_id, step_n, agent_name: str, output_dict: dict,
+                        usage=None):
+    """Persist a single-call agent output (Planner or Reviewer) as a RunStep."""
+    try:
+        from db.models import RunStep
+        import json
+        step = RunStep(
+            run_id=run_id,
+            n=step_n,
+            agent_name=agent_name,
+            stop_reason="end_turn",
+            text=json.dumps(output_dict)[:5000],
+            input_tokens=getattr(usage, 'input_tokens', 0) if usage else 0,
+            output_tokens=getattr(usage, 'output_tokens', 0) if usage else 0,
+            tools=None,
+        )
+        session.add(step)
+        session.commit()
+    except Exception as e:
+        log.warning("DB agent step persist failed (non-fatal): %s", e)
+        try:
+            session.rollback()
+        except Exception:
+            pass
+
+
+MAX_REVIEW_ROUNDS = int(os.getenv("MAX_REVIEW_ROUNDS", "2"))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -158,7 +190,7 @@ def run_issue(
         submit_changes,
     )
     from agent.loop import Budget, ReActAgent, RunResult
-    from agent.providers import ProviderError
+    from agent.providers import ProviderError, get_provider
 
     run_id = uuid.uuid4()
     run_id_str = str(run_id)
@@ -248,6 +280,8 @@ def run_issue(
                 pass
 
     try:
+        # Step counter shared across all agents so step numbers are globally unique.
+        _global_step_n = 0
         # ── 1. Fetch the issue ────────────────────────────────────────────
         log.info("[%s] fetching issue %s#%d", run_id_str, repo, issue_number)
         try:
@@ -269,16 +303,63 @@ def run_issue(
                 except Exception:
                     pass
 
-        # ── 2. Comment "on it" ────────────────────────────────────────────
+        # ── 2. Planner — structured analysis of the issue ─────────────────
+        from agent.planner import run_planner
+        from agent.reviewer import build_feedback_task, run_reviewer
+        from agent.schemas import PlannerOutput, ReviewerOutput
+
+        plan = PlannerOutput()   # safe empty default
+        planner_usage = None
+        log.info("[%s] running Planner agent", run_id_str)
+        try:
+            plan, planner_usage = run_planner(
+                issue.to_task(),
+                workspace if workspace and workspace.exists() else Path("."),
+                skip_retrieval=True,  # index not built yet; retrieval happens after clone
+            )
+            _persist_agent_step(db_session, run_id, _global_step_n, "planner",
+                                plan.to_dict(), planner_usage)
+            _global_step_n += 1
+            # Store planner output on the run row.
+            if run_db and db_session:
+                try:
+                    run_db.planner_output = plan.to_dict()
+                    db_session.commit()
+                except Exception:
+                    try:
+                        db_session.rollback()
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.warning("[%s] Planner failed (continuing with empty plan): %s", run_id_str, e)
+
+        # Post pre-work comment using the Planner's understanding.
         if COMMENT_ON_START:
             try:
-                client.comment_on_issue(
-                    repo, issue_number,
-                    f"🤖 Auto-SWE agent is working on this issue. (run `{run_id_str}`)"
+                steps_str = ""
+                if plan.plan_steps:
+                    steps_str = "\n".join(f"- {s}" for s in plan.plan_steps)
+                    steps_str = f"\n\n**Plan:**\n{steps_str}"
+                root_cause = (
+                    f"\n\n**Root cause hypothesis:**\n{plan.root_cause_hypothesis}"
+                    if plan.root_cause_hypothesis else ""
                 )
-            except GitHubError as e:
-                # Non-fatal — the agent can still work without posting a comment.
-                log.warning("[%s] could not post start comment: %s", run_id_str, e)
+                comment_body = (
+                    f"🤖 **Auto-SWE agent is investigating this issue.**\n\n"
+                    f"**My understanding:**\n{plan.understanding or 'Analysing...'}\n"
+                    f"{root_cause}{steps_str}\n\n"
+                    f"I will open a PR shortly. *(run `{run_id_str}`)*"
+                )
+                client.comment_on_issue(repo, issue_number, comment_body)
+            except Exception as e:
+                log.warning("[%s] pre-work comment failed: %s", run_id_str, e)
+                try:
+                    client.comment_on_issue(
+                        repo, issue_number,
+                        f"🤖 Auto-SWE agent is working on this issue. (run `{run_id_str}`)"
+                    )
+                except GitHubError as github_err:
+                    log.warning("[%s] could not post start comment: %s", run_id_str, github_err)
 
         # ── 3. Clone ─────────────────────────────────────────────────────
         workspace = WORKSPACE_ROOT / run_id_str / "repo"
@@ -342,51 +423,155 @@ def run_issue(
                 log.error("[%s] %s", run_id_str, result["error"])
                 return result
 
-        # ── 7. Run the ReAct agent ───────────────────────────────────────
-        log.info("[%s] starting ReAct agent loop", run_id_str)
+        # ── 7. Coder — ReAct agent guided by the plan ────────────────────
+        log.info("[%s] starting Coder agent (plan has %d steps)",
+                 run_id_str, len(plan.plan_steps))
         try:
             agent = ReActAgent(
                 workspace=workspace,
-                auto_index=False,  # we already indexed in step 5
+                auto_index=False,  # already indexed in step 5
                 sandbox=sandbox,
             )
-            agent_result: RunResult = agent.run(issue.to_task())
+            agent_result: RunResult = agent.run_with_plan(issue.to_task(), plan)
         except (ProviderError, ValueError) as e:
             result["status"] = "provider_error"
             result["error"] = f"agent setup/run failed: {e}"
             log.error("[%s] %s", run_id_str, result["error"])
             return result
 
-        # Record budget usage regardless of outcome.
+        # Record budget usage.
         b = agent_result.budget
         result["steps"] = b.steps
         result["input_tokens"] = b.total.input_tokens
         result["output_tokens"] = b.total.output_tokens
         result["cost_usd"] = round(b.spent_usd, 6)
-        result["final_text"] = agent_result.final_text[:2000]  # cap for JSON
+        result["final_text"] = agent_result.final_text[:2000]
 
-        log.info("[%s] agent finished: %s", run_id_str, agent_result.summary())
+        log.info("[%s] Coder finished: %s", run_id_str, agent_result.summary())
 
-        # ── M4: Persist each step from the trace ─────────────────────────
+        # Persist Coder steps.
         if db_session and run_db:
-            for step_n, step_data in enumerate(agent_result.steps):
-                _persist_step(db_session, run_id, step_n, step_data)
+            for step_data in agent_result.steps:
+                _persist_step(db_session, run_id, _global_step_n, step_data, "coder")
+                _global_step_n += 1
+
+        # ── 7b. Reviewer — check the diff ────────────────────────────────
+        last_review = ReviewerOutput(verdict="approve", summary="No review performed.")
+        if agent_result.status == "completed":
+            # Capture the diff for the Reviewer.
+            diff_text = ""
+            try:
+                proc = subprocess.run(
+                    ["git", "-C", str(workspace), "diff"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                diff_text = proc.stdout.strip()
+            except Exception as e:
+                log.warning("[%s] could not capture diff for reviewer: %s", run_id_str, e)
+
+            test_output = result.get("final_text", "")[:2000]
+
+            for review_round in range(MAX_REVIEW_ROUNDS):
+                log.info("[%s] running Reviewer (round %d/%d)",
+                         run_id_str, review_round + 1, MAX_REVIEW_ROUNDS)
+                try:
+                    last_review, rev_usage = run_reviewer(
+                        issue.to_task(), plan, diff_text, test_output,
+                    )
+                    _persist_agent_step(db_session, run_id, _global_step_n,
+                                        "reviewer", last_review.to_dict(), rev_usage)
+                    _global_step_n += 1
+                    # Update reviewer output on the run row.
+                    if run_db and db_session:
+                        try:
+                            run_db.reviewer_output = last_review.to_dict()
+                            db_session.commit()
+                        except Exception:
+                            try:
+                                db_session.rollback()
+                            except Exception:
+                                pass
+                except Exception as e:
+                    log.warning("[%s] Reviewer failed (skipping): %s", run_id_str, e)
+                    break
+
+                if last_review.approved:
+                    log.info("[%s] Reviewer approved (round %d)",
+                             run_id_str, review_round + 1)
+                    break
+
+                if review_round < MAX_REVIEW_ROUNDS - 1:
+                    # Re-run the Coder with reviewer feedback.
+                    log.info("[%s] Reviewer requested changes — re-running Coder",
+                             run_id_str)
+                    feedback_task = build_feedback_task(issue.to_task(), plan, last_review)
+                    try:
+                        agent_result = agent.run(feedback_task)
+                        b = agent_result.budget
+                        result["steps"] += b.steps
+                        result["input_tokens"] += b.total.input_tokens
+                        result["output_tokens"] += b.total.output_tokens
+                        result["cost_usd"] = round(
+                            result["cost_usd"] + b.spent_usd, 6)
+                        result["final_text"] = agent_result.final_text[:2000]
+                        if db_session and run_db:
+                            for step_data in agent_result.steps:
+                                _persist_step(db_session, run_id,
+                                              _global_step_n, step_data, "coder")
+                                _global_step_n += 1
+                        # Refresh diff for next review round.
+                        try:
+                            proc = subprocess.run(
+                                ["git", "-C", str(workspace), "diff"],
+                                capture_output=True, text=True, timeout=30,
+                            )
+                            diff_text = proc.stdout.strip()
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        log.warning("[%s] Coder re-run failed: %s", run_id_str, e)
+                        break
+                else:
+                    log.warning(
+                        "[%s] max review rounds reached with outstanding concerns — "
+                        "opening PR with 'needs-human-review' note", run_id_str
+                    )
 
         # ── 8. Submit changes (commit → push → PR) ──────────────────────
         if agent_result.status == "completed":
             log.info("[%s] agent completed — submitting changes", run_id_str)
             try:
                 pr_title = f"Fix #{issue_number}: {issue.title}"
+
+                # Build rich PR body deterministically from agent outputs
+                # (no extra LLM call needed — we already have all the data).
+                reviewer_section = (
+                    f"\n\n## Reviewer notes\n"
+                    f"{last_review.summary}  "
+                    f"*(confidence: {last_review.confidence})*"
+                )
+                if last_review.concerns:
+                    concerns_str = "\n".join(
+                        f"- {c}" for c in last_review.concerns
+                    )
+                    reviewer_section += f"\n\n**Concerns addressed:**\n{concerns_str}"
+                if not last_review.approved:
+                    reviewer_section += "\n\n> ⚠️ Reviewer still had concerns — human review recommended."
+
                 pr_body = (
                     f"Closes #{issue_number}\n\n"
-                    f"## What changed\n\n{agent_result.final_text[:1500]}\n\n"
+                    f"## Issue\n{plan.understanding or issue.title}\n\n"
+                    f"## Root cause\n{plan.root_cause_hypothesis or 'See diff.'}\n\n"
+                    f"## Fix\n{agent_result.final_text[:1500]}\n\n"
+                    f"## Tests\n{plan.test_strategy or 'See test results in CI.'}\n"
+                    f"{reviewer_section}\n\n"
                     f"---\n"
-                    f"*Automated by auto-swe-agent · "
-                    f"run `{run_id_str}` · "
-                    f"{b.steps} steps · "
-                    f"{b.total.input_tokens + b.total.output_tokens} tokens · "
-                    f"${b.spent_usd:.4f}*"
+                    f"*Automated by auto-swe-agent · run `{run_id_str}` · "
+                    f"{result['steps']} steps · "
+                    f"{result['input_tokens'] + result['output_tokens']} tokens · "
+                    f"${result['cost_usd']:.4f}*"
                 )
+
                 pr = submit_changes(
                     workspace,
                     repo=repo,

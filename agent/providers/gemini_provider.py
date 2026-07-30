@@ -157,7 +157,7 @@ class GeminiProvider:
         for call, content, is_error in results:
             payload = {"error": content} if is_error else {"output": content}
             parts.append(types.Part.from_function_response(name=call.name, response=payload))
-        return types.Content(role="tool", parts=parts)
+        return types.Content(role="user", parts=parts)
 
     # ── accounting ─────────────────────────────────────────────────────────────
 

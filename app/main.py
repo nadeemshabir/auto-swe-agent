@@ -344,10 +344,16 @@ async def get_run(run_id: str):
 
 
 @app.get("/runs/{run_id}/steps")
-async def get_run_steps(run_id: str):
+async def get_run_steps(run_id: str, agent: str | None = None):
     """Fetch the ordered step-by-step trace of a run from PostgreSQL.
 
     Enables granular live tracking and replay (plan2.md §7.5).
+
+    Parameters
+    ----------
+    agent : str, optional
+        Filter steps by agent name. One of: 'planner', 'coder', 'reviewer'.
+        Omit to return all steps.
     """
     from db.session import get_session
     from db.models import Run, RunStep
@@ -362,11 +368,16 @@ async def get_run_steps(run_id: str):
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
 
-        steps = session.query(RunStep).filter_by(run_id=run_uuid).order_by(RunStep.n.asc()).all()
+        query = session.query(RunStep).filter_by(run_id=run_uuid)
+        if agent:
+            query = query.filter(RunStep.agent_name == agent)
+        steps = query.order_by(RunStep.n.asc()).all()
         return {
             "run_id": run_id,
+            "agent_filter": agent,
             "steps": [s.to_dict() for s in steps],
         }
+
 
 
 # ═════════════════════════════════════════════════════════════════════════════

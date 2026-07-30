@@ -1,6 +1,7 @@
 # docker-compose.yml
 # Wires all containers together for local development and staging deployments.
-#
+#docker compose is not for deployment its mainly a way to run multiple containers together with one command
+
 # Services:
 #   postgres   — PostgreSQL 16 (persistent run data + step traces)
 #   redis      — Redis 7 (Celery broker + result backend)

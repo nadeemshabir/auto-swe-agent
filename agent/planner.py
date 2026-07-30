@@ -1,0 +1,401 @@
+"""
+agent/planner.py
+The Planner agent — first stage of the multi-agent pipeline.
+
+Given a GitHub issue and retrieved codebase context, the Planner produces a
+structured analysis (PlannerOutput) that the Coder agent will follow. It makes
+NO code edits — only reasons about what to change and why.
+
+Design:
+  - Single LLM call (not a ReAct loop): planning is a one-shot structured
+    reasoning task, not an interactive tool-use conversation.
+  - Uses its own provider instance, configurable via PLANNER_PROVIDER /
+    PLANNER_MODEL env vars. Defaults to the global LLM_PROVIDER / LLM_MODEL
+    so you can run the whole pipeline on a single provider (e.g. Gemini) or
+    use a stronger model just for planning (e.g. Claude Opus).
+  - Calls retrieval.assemble_context() to get the top-k relevant code chunks
+    before prompting, so the Planner sees the actual codebase.
+  - If JSON parsing fails on the first attempt, retries once with a nudge.
+    If it still fails, falls back to using the raw text as understanding.
+  - Records token usage so it counts toward the run's total budget.
+  - Follow the project's self-test convention: python -m agent.planner
+
+Offline self-test:  python -m agent.planner   (no API key needed)
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import sys
+from pathlib import Path
+
+# Load .env (same pattern as agent/loop.py).
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:
+    pass
+
+try:
+    from .providers import ProviderError, Usage, get_provider
+    from .schemas import PlannerOutput
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from agent.providers import ProviderError, Usage, get_provider
+    from agent.schemas import PlannerOutput
+
+log = logging.getLogger("agent.planner")
+
+# ── configuration ────────────────────────────────────────────────────────────
+
+# Retrieval settings for the Planner's codebase context.
+PLANNER_RETRIEVAL_K = int(os.getenv("PLANNER_RETRIEVAL_K", "10"))
+PLANNER_TOKEN_BUDGET = int(os.getenv("PLANNER_TOKEN_BUDGET", "6000"))
+
+# ── system prompt ────────────────────────────────────────────────────────────
+
+PLANNER_SYSTEM = """\
+You are an expert software engineer analyzing a GitHub issue.
+
+Your job is to produce a structured analysis and repair plan. You will NOT
+write any code — a separate Coder agent will execute your plan.
+
+You will receive:
+1. The issue title, body, and labels
+2. Relevant code snippets retrieved from the repository
+
+Respond with ONLY a JSON object in this exact format (no extra text):
+{
+  "understanding": "2-3 sentence summary of what the issue reports",
+  "root_cause_hypothesis": "your best guess at the root cause",
+  "files_to_touch": ["path/to/file1.py", "path/to/file2.py"],
+  "plan_steps": [
+    "Step 1: ...",
+    "Step 2: ..."
+  ],
+  "test_strategy": "description of what tests to add or run",
+  "risk_notes": "edge cases, potential breaking changes, or 'None'"
+}
+
+Be specific. Name exact functions, classes, and line ranges when possible.
+If the issue is unclear, state your assumptions explicitly in risk_notes.
+Do NOT wrap the JSON in markdown fences. Output only the JSON object.
+"""
+
+RETRY_NUDGE = """\
+Your previous response was not valid JSON. Please respond with ONLY a JSON \
+object matching the format described in the system prompt. No extra text, \
+no markdown fences — just the raw JSON object starting with { and ending with }.
+"""
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Provider helper
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _get_planner_provider():
+    """Get the LLM provider for the Planner agent.
+
+    Resolution order:
+      1. PLANNER_PROVIDER + PLANNER_MODEL env vars (explicit per-agent config)
+      2. LLM_PROVIDER + LLM_MODEL env vars (shared global config)
+
+    This lets you run everything on Gemini by default, or override just the
+    Planner to use Claude Opus for higher-quality planning.
+    """
+    planner_provider = os.getenv("PLANNER_PROVIDER", "").strip()
+    planner_model = os.getenv("PLANNER_MODEL", "").strip()
+
+    kwargs = {}
+    if planner_model:
+        kwargs["model"] = planner_model
+
+    if planner_provider:
+        return get_provider(name=planner_provider, **kwargs)
+
+    # No per-agent override — use the global defaults.
+    return get_provider(**kwargs)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Retrieval helper
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _retrieve_context(workspace: str | Path, issue_text: str,
+                      k: int = PLANNER_RETRIEVAL_K,
+                      token_budget: int = PLANNER_TOKEN_BUDGET) -> str:
+    """Retrieve relevant code chunks for the Planner's context.
+
+    Uses the same retrieval pipeline as the Coder (agent/retrieval.py).
+    If retrieval fails (deps missing, index not built), returns an empty
+    string — the Planner can still produce a useful plan from the issue alone.
+    """
+    try:
+        try:
+            from . import retrieval
+        except ImportError:
+            from agent import retrieval
+        ctx = retrieval.assemble_context(
+            issue_text, repo=str(workspace), k=k, token_budget=token_budget,
+        )
+        return ctx or ""
+    except Exception as e:
+        log.warning("planner: retrieval failed (will plan without code context): %s", e)
+        return ""
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# The Planner
+# ═════════════════════════════════════════════════════════════════════════════
+
+def run_planner(
+    issue_text: str,
+    workspace: str | Path,
+    *,
+    provider=None,
+    retrieval_k: int = PLANNER_RETRIEVAL_K,
+    retrieval_budget: int = PLANNER_TOKEN_BUDGET,
+    max_tokens: int = 2048,
+    skip_retrieval: bool = False,
+) -> tuple[PlannerOutput, Usage]:
+    """Run the Planner agent.
+
+    Parameters
+    ----------
+    issue_text : str
+        The task string (from Issue.to_task()).
+    workspace : str | Path
+        Path to the cloned repository.
+    provider : LLMProvider, optional
+        Override the provider. If None, uses PLANNER_PROVIDER / LLM_PROVIDER.
+    retrieval_k : int
+        Number of code chunks to retrieve for context.
+    retrieval_budget : int
+        Token budget for retrieved context.
+    max_tokens : int
+        Max output tokens for the LLM call.
+    skip_retrieval : bool
+        If True, skip retrieval (for testing or when the index isn't built).
+
+    Returns
+    -------
+    tuple[PlannerOutput, Usage]
+        The structured plan and the token usage for budget tracking.
+    """
+    provider = provider or _get_planner_provider()
+
+    # Retrieve codebase context (unless skipped).
+    code_context = ""
+    if not skip_retrieval:
+        code_context = _retrieve_context(workspace, issue_text,
+                                          k=retrieval_k,
+                                          token_budget=retrieval_budget)
+
+    # Build the user message.
+    parts = [issue_text]
+    if code_context:
+        parts.append(f"\n\n--- RELEVANT CODE FROM THE REPOSITORY ---\n{code_context}")
+    user_text = "\n".join(parts)
+
+    # First attempt.
+    messages = [provider.user_message(user_text)]
+    total_usage = Usage()
+
+    try:
+        resp = provider.complete(
+            system=PLANNER_SYSTEM,
+            messages=messages,
+            tools=[],  # Planner doesn't use tools
+            max_tokens=max_tokens,
+        )
+    except ProviderError as e:
+        log.error("planner: provider error on first attempt: %s", e)
+        return PlannerOutput(understanding=f"Planner failed: {e}"), Usage()
+
+    total_usage = total_usage + resp.usage
+    plan = PlannerOutput.from_llm_text(resp.text)
+
+    # If parsing got structured steps, we have a real plan — done.
+    # (When JSON parsing fails, from_llm_text() puts raw text in understanding
+    # but leaves plan_steps empty.  We want to retry in that case.)
+    if plan.plan_steps:
+        log.info("planner: produced plan with %d steps, %d files",
+                 len(plan.plan_steps), len(plan.files_to_touch))
+        return plan, total_usage
+
+    # Retry with a nudge.
+    log.warning("planner: first attempt produced empty/unparseable output, retrying")
+    try:
+        messages.append(provider.assistant_turn(resp))
+        messages.append(provider.user_message(RETRY_NUDGE))
+        resp2 = provider.complete(
+            system=PLANNER_SYSTEM,
+            messages=messages,
+            tools=[],
+            max_tokens=max_tokens,
+        )
+        total_usage = total_usage + resp2.usage
+        plan = PlannerOutput.from_llm_text(resp2.text)
+    except ProviderError as e:
+        log.error("planner: provider error on retry: %s", e)
+        # Use whatever we got from the first attempt.
+
+    if not plan.plan_steps:
+        log.warning("planner: retry also produced empty output; using raw text as understanding")
+        plan = PlannerOutput(understanding=(resp.text or "No plan generated.").strip()[:2000])
+
+    log.info("planner: produced plan with %d steps, %d files",
+             len(plan.plan_steps), len(plan.files_to_touch))
+    return plan, total_usage
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Offline self-test
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _selftest() -> int:
+    """Exercise the Planner with a mock provider (no API key needed)."""
+    import tempfile
+
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    failures: list[str] = []
+
+    def check(name: str, cond: bool, extra: str = "") -> None:
+        status = "ok  " if cond else "FAIL"
+        print(f"  [{status}] {name}" + (f" — {extra}" if extra and not cond else ""))
+        if not cond:
+            failures.append(name)
+
+    print("agent/planner.py self-test")
+    print()
+
+    # ── Mock provider ────────────────────────────────────────────────────
+    canned_response = json.dumps({
+        "understanding": "The issue reports a crash when input is empty.",
+        "root_cause_hypothesis": "The parse() function doesn't check for None.",
+        "files_to_touch": ["src/parser.py", "tests/test_parser.py"],
+        "plan_steps": [
+            "Step 1: Add a None check at the top of parse()",
+            "Step 2: Add a test for empty input",
+        ],
+        "test_strategy": "Run pytest tests/test_parser.py",
+        "risk_notes": "None",
+    })
+
+    class MockUsage:
+        input_tokens = 500
+        output_tokens = 200
+
+    class MockResponse:
+        def __init__(self, text):
+            self.text = text
+            self.tool_calls = []
+            self.stop_reason = "end_turn"
+            self.usage = Usage(input_tokens=500, output_tokens=200)
+            self.raw = None
+
+    class MockProvider:
+        name = "mock"
+        model = "mock-model"
+
+        def __init__(self, responses=None):
+            self._responses = list(responses or [MockResponse(canned_response)])
+            self._call_count = 0
+
+        def complete(self, *, system, messages, tools, max_tokens):
+            idx = min(self._call_count, len(self._responses) - 1)
+            self._call_count += 1
+            return self._responses[idx]
+
+        def user_message(self, text):
+            return {"role": "user", "content": text}
+
+        def assistant_turn(self, resp):
+            return {"role": "assistant", "content": resp.text}
+
+        def tool_result_message(self, results):
+            return {"role": "user", "content": "tool results"}
+
+        def count_tokens(self, *, system, messages, tools):
+            return 100
+
+        def cost_usd(self, usage):
+            return 0.001
+
+    # ── Test 1: Happy path ───────────────────────────────────────────────
+    print("happy path")
+    with tempfile.TemporaryDirectory() as d:
+        plan, usage = run_planner(
+            "Fix the crash on empty input.",
+            d,
+            provider=MockProvider(),
+            skip_retrieval=True,
+        )
+        check("understanding parsed", "crash" in plan.understanding.lower())
+        check("files_to_touch has 2 files", len(plan.files_to_touch) == 2)
+        check("plan_steps has 2 steps", len(plan.plan_steps) == 2)
+        check("usage tracked", usage.input_tokens == 500)
+        check("not empty", not plan.is_empty())
+
+    # ── Test 2: Retry on bad JSON ────────────────────────────────────────
+    print("retry on bad JSON")
+    with tempfile.TemporaryDirectory() as d:
+        plan, usage = run_planner(
+            "Fix the crash.",
+            d,
+            provider=MockProvider(responses=[
+                MockResponse("Here is my analysis..."),  # bad: no JSON
+                MockResponse(canned_response),            # retry: good JSON
+            ]),
+            skip_retrieval=True,
+        )
+        check("retry succeeded", "crash" in plan.understanding.lower())
+        check("usage accumulated", usage.input_tokens == 1000)  # 500 + 500
+
+    # ── Test 3: Total failure → fallback ─────────────────────────────────
+    print("total failure fallback")
+    with tempfile.TemporaryDirectory() as d:
+        plan, usage = run_planner(
+            "Fix the crash.",
+            d,
+            provider=MockProvider(responses=[
+                MockResponse("I'll look into this..."),  # no JSON
+                MockResponse("Still working on it..."),  # no JSON on retry either
+            ]),
+            skip_retrieval=True,
+        )
+        check("fallback uses raw text", "look into" in plan.understanding.lower())
+        check("plan is effectively 'empty' (no steps)", len(plan.plan_steps) == 0)
+
+    # ── Test 4: round-trip to_dict/from_dict ─────────────────────────────
+    print("serialization")
+    with tempfile.TemporaryDirectory() as d:
+        plan, _ = run_planner(
+            "Fix it.",
+            d,
+            provider=MockProvider(),
+            skip_retrieval=True,
+        )
+        d = plan.to_dict()
+        restored = PlannerOutput.from_dict(d)
+        check("round-trip preserves understanding", restored.understanding == plan.understanding)
+        check("round-trip preserves files", restored.files_to_touch == plan.files_to_touch)
+
+    # ── Test 5: provider resolution ──────────────────────────────────────
+    print("provider resolution")
+    # Can't test actual provider creation without API keys, but we can verify
+    # the function exists and accepts the right args.
+    check("_get_planner_provider is callable", callable(_get_planner_provider))
+
+    print()
+    if failures:
+        print(f"SELF-TEST FAILED: {len(failures)} check(s) failed → {failures}")
+        return 1
+    print("self-test OK — planner parsing, retry, fallback, and serialization all work.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_selftest())

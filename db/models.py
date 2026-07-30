@@ -88,6 +88,12 @@ class Run(Base):
     error_detail = Column(Text, nullable=True)
     final_text   = Column(Text, nullable=True)
 
+    # Multi-agent outputs — stored as JSON so the API can expose them without
+    # extra queries and the PR description assembly has all data in one place.
+    # Nullable for backward compatibility with pre-multi-agent runs.
+    planner_output  = Column(PortableJSON, nullable=True)  # PlannerOutput.to_dict()
+    reviewer_output = Column(PortableJSON, nullable=True)  # Last ReviewerOutput.to_dict()
+
     # Relationships
     steps = relationship("RunStep", back_populates="run", order_by="RunStep.n",
                          cascade="all, delete-orphan")
@@ -118,6 +124,8 @@ class Run(Base):
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
             "error_detail": self.error_detail,
+            "planner_output": self.planner_output,
+            "reviewer_output": self.reviewer_output,
         }
 
 
@@ -146,6 +154,10 @@ class RunStep(Base):
     # Uses JSONB on Postgres for indexability; falls back to JSON on SQLite.
     tools        = Column(PortableJSON, nullable=True)
 
+    # Multi-agent: which agent produced this step.
+    # Values: "planner", "coder", "reviewer". Nullable for old rows.
+    agent_name   = Column(String(20), nullable=True)
+
     created_at   = Column(DateTime(timezone=True), nullable=False, default=_utcnow)
 
     # Relationships
@@ -162,6 +174,7 @@ class RunStep(Base):
             "id": str(self.id),
             "run_id": str(self.run_id),
             "n": self.n,
+            "agent_name": self.agent_name,
             "stop_reason": self.stop_reason,
             "text": self.text,
             "input_tokens": self.input_tokens,

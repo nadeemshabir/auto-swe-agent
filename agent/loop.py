@@ -486,6 +486,10 @@ class ReActAgent:
         # auto_index: parse + embed the workspace (local sentence-transformers
         # model) into ChromaDB before the run, so retrieve_context has data.
         self._auto_index = auto_index
+        # Multi-agent: when set by run_with_plan(), the Coder logs a warning
+        # if it edits a file not in this list.  Non-blocking — the edit still
+        # proceeds, but the deviation is visible in the step trace.
+        self._files_to_touch: list[str] | None = None
 
     # ── tool dispatch ─────────────────────────────────────────────────────────
     #tool dispatch: a function that takes a tool call and returns the result of the tool call
@@ -495,6 +499,19 @@ class ReActAgent:
         if entry is None:
             return (f"unknown tool: {call.name}", True)
         _, handler = entry
+
+        # Multi-agent guardrail: warn (don't block) if the Coder edits a file
+        # outside the Planner's files_to_touch list.  The edit proceeds, but
+        # the deviation is logged and visible in the step trace for the
+        # Reviewer to catch.
+        if (self._files_to_touch is not None
+                and call.name == "edit_file"
+                and (call.args or {}).get("path")):
+            path = (call.args or {}).get("path", "")
+            if path and path not in self._files_to_touch:
+                log.warning("coder editing %s which is NOT in the plan's files_to_touch: %s",
+                            path, self._files_to_touch)
+
         try:
             result = handler(call.args or {})
             return (_clip(str(result), MAX_TOOL_RESULT_CHARS), False)
@@ -607,6 +624,61 @@ class ReActAgent:
     def _load_and_index(self) -> None:
         retrieval = _load_retrieval()
         retrieval.index_repo(str(self.workspace))
+
+    # ── multi-agent: plan-aware run ───────────────────────────────────────────
+
+    def run_with_plan(self, task: str, plan) -> RunResult:
+        """Run the Coder agent with a structured Planner output as context.
+
+        The plan is injected into the task string as structured context so the
+        Coder follows the Planner's analysis.  The Coder's existing ReAct loop
+        is reused unchanged — only the input is enriched.
+
+        Parameters
+        ----------
+        task : str
+            The original task string (e.g. from Issue.to_task()).
+        plan : PlannerOutput
+            The Planner agent's structured analysis.
+
+        Returns
+        -------
+        RunResult
+            Same as run() — status, final_text, steps, budget.
+        """
+        enhanced = self._build_planned_task(task, plan)
+        self._files_to_touch = getattr(plan, 'files_to_touch', None)
+        return self.run(enhanced)
+
+    @staticmethod
+    def _build_planned_task(task: str, plan) -> str:
+        """Prepend the Planner's structured context to the raw task string.
+
+        The resulting prompt tells the Coder what to fix, which files to touch,
+        and in what order — while the original issue text is preserved below
+        for full context."""
+        parts = [
+            "A Planning agent has analyzed this issue and produced the following",
+            "structured repair plan. Follow the plan steps in order. Only modify",
+            "files listed in files_to_touch unless you discover the plan is",
+            "incomplete — in that case, note the deviation in your final summary.",
+            "",
+            "=== REPAIR PLAN ===",
+            f"Understanding: {getattr(plan, 'understanding', '')}",
+            f"Root cause: {getattr(plan, 'root_cause_hypothesis', '')}",
+            f"Files to touch: {', '.join(getattr(plan, 'files_to_touch', []))}",
+            "Steps:",
+        ]
+        for i, step in enumerate(getattr(plan, 'plan_steps', []), 1):
+            parts.append(f"  {i}. {step}")
+        parts.extend([
+            f"Test strategy: {getattr(plan, 'test_strategy', '')}",
+            f"Risk notes: {getattr(plan, 'risk_notes', '')}",
+            "",
+            "=== ORIGINAL ISSUE ===",
+            task,
+        ])
+        return "\n".join(parts)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
