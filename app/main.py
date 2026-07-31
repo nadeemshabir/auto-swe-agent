@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +47,27 @@ log = logging.getLogger("app.main")
 GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
 MAX_WEBHOOK_BODY_BYTES = int(os.getenv("MAX_WEBHOOK_BODY_BYTES", "1048576"))  # 1 MB
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+# Shared secret for POST /runs. Fail-closed, matching GITHUB_WEBHOOK_SECRET:
+# with no token configured the endpoint is disabled rather than open. An
+# unauthenticated /runs lets anyone who finds the URL make the agent clone
+# arbitrary repositories and burn the LLM budget (plan2.md §22 F8).
+AGENT_API_TOKEN = os.getenv("AGENT_API_TOKEN", "")
+
+# Optional comma-separated allowlist of "owner/repo" slugs the agent may work
+# on. Empty = no restriction. Authentication alone still lets a leaked token
+# target any repository, so set this in any shared deployment.
+AGENT_REPO_ALLOWLIST = {
+    r.strip() for r in os.getenv("AGENT_REPO_ALLOWLIST", "").split(",") if r.strip()
+}
+
+# Simple per-process rate limit on POST /runs: N starts per window, per client.
+# Deliberately in-process — it bounds accidental abuse and runaway scripts
+# without adding a Redis dependency. It is NOT a distributed limit: with
+# multiple API replicas each enforces its own budget. Revisit if that matters.
+RUNS_RATE_LIMIT = int(os.getenv("RUNS_RATE_LIMIT", "10"))
+RUNS_RATE_WINDOW_S = int(os.getenv("RUNS_RATE_WINDOW_S", "60"))
+_rate_buckets: dict[str, list[float]] = {}
 
 # ── FastAPI app ──────────────────────────────────────────────────────────────
 
@@ -83,6 +105,81 @@ def _verify_signature(body: bytes, signature: str, secret: str) -> bool:
         secret.encode("utf-8"), body, hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(expected, signature)
+
+
+def _require_api_token(authorization: str | None, x_agent_token: str | None) -> None:
+    """Authenticate a manual trigger, or raise 401/503.
+
+    Accepts either `Authorization: Bearer <token>` or `X-Agent-Token: <token>`.
+    Comparison is constant-time, same as the webhook HMAC.
+
+    Fail-closed when unconfigured: an unset AGENT_API_TOKEN disables the
+    endpoint (503) rather than leaving it open. This mirrors how
+    GITHUB_WEBHOOK_SECRET already behaves and means a deployment cannot
+    accidentally expose /runs by forgetting to set a variable.
+    """
+    if not AGENT_API_TOKEN:
+        log.warning("POST /runs called but AGENT_API_TOKEN is not set — refusing")
+        raise HTTPException(
+            status_code=503,
+            detail="Manual trigger is disabled: AGENT_API_TOKEN is not configured.",
+        )
+
+    presented = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        presented = authorization[7:].strip()
+    elif x_agent_token:
+        presented = x_agent_token.strip()
+
+    if not presented or not hmac.compare_digest(presented, AGENT_API_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid or missing API token")
+
+
+def _check_repo_allowed(repo: str) -> None:
+    """Reject repositories outside the allowlist, when one is configured."""
+    if AGENT_REPO_ALLOWLIST and repo not in AGENT_REPO_ALLOWLIST:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Repository {repo!r} is not in AGENT_REPO_ALLOWLIST",
+        )
+
+
+def _check_rate_limit(client_key: str) -> None:
+    """Allow at most RUNS_RATE_LIMIT starts per RUNS_RATE_WINDOW_S, per client."""
+    now = time.monotonic()
+    window_start = now - RUNS_RATE_WINDOW_S
+    hits = [t for t in _rate_buckets.get(client_key, []) if t > window_start]
+    if len(hits) >= RUNS_RATE_LIMIT:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded: {RUNS_RATE_LIMIT} runs per "
+                   f"{RUNS_RATE_WINDOW_S}s",
+        )
+    hits.append(now)
+    _rate_buckets[client_key] = hits
+
+
+def _enqueue_run(run_issue, repo: str, issue_number: int, use_sandbox: bool = False):
+    """Enqueue a run under a single, caller-visible UUID.
+
+    The same UUID is used for BOTH Celery's `task_id` and the `runs.id` the
+    worker writes, so the id handed back to the caller resolves at
+    `GET /runs/{id}` and `GET /runs/{id}/steps` as well as in the Celery result
+    backend.
+
+    Previously the API returned `async_result.id` (a Celery task id) while the
+    worker minted its own unrelated `uuid4()` for the database row. The two
+    could never match, so the DB lookup always missed, `/runs/{id}` silently
+    degraded to the Celery fallback (losing planner_output, reviewer_output and
+    test_evidence), and `/runs/{id}/steps` returned 404 every time
+    (plan2.md §16 D17, §22 F5).
+    """
+    run_id = uuid.uuid4()
+    return run_issue.apply_async(
+        args=[repo, issue_number, use_sandbox],
+        kwargs={"run_id": str(run_id)},
+        task_id=str(run_id),
+    )
 
 
 @app.post("/webhooks/github", status_code=202)
@@ -154,9 +251,28 @@ async def webhook_github(
             log.warning("Failed to record skipped webhook event: %s", e)
         return Response(status_code=204)
 
+    # Defence in depth: the payload is HMAC-signed, so it came from a repo whose
+    # webhook we configured — but if an allowlist is set, honour it here too.
+    # Treated as non-actionable (204) rather than an error: from GitHub's side
+    # there is nothing to retry.
+    if AGENT_REPO_ALLOWLIST and issue.repo not in AGENT_REPO_ALLOWLIST:
+        log.warning("webhook: %s is not in AGENT_REPO_ALLOWLIST — ignoring", issue.repo)
+        try:
+            with get_session() as session:
+                session.add(WebhookEvent(
+                    delivery_id=delivery_id,
+                    event_type=event_type,
+                    repo=issue.repo,
+                    issue_number=issue.number,
+                    action_taken="skipped",
+                ))
+        except Exception as e:
+            log.warning("Failed to record disallowed-repo webhook event: %s", e)
+        return Response(status_code=204)
+
     # ── 5. Enqueue the task ──────────────────────────────────────────────
     from workers.tasks import run_issue
-    async_result = run_issue.delay(issue.repo, issue.number)
+    async_result = _enqueue_run(run_issue, issue.repo, issue.number)
 
     # Record enqueued event in DB
     try:
@@ -194,14 +310,28 @@ async def webhook_github(
 # ═════════════════════════════════════════════════════════════════════════════
 
 @app.post("/runs", status_code=202)
-async def manual_trigger(req: ManualRunRequest):
+async def manual_trigger(
+    req: ManualRunRequest,
+    request: Request,
+    authorization: str | None = Header(None),
+    x_agent_token: str | None = Header(None),
+):
     """Manually trigger an agent run for a given repo + issue number.
 
-    Useful for testing without setting up webhooks. Returns 202 with the
-    Celery task ID so you can poll GET /runs/{id} for the result.
+    Requires a shared secret (`Authorization: Bearer <AGENT_API_TOKEN>` or
+    `X-Agent-Token`), honours AGENT_REPO_ALLOWLIST, and is rate limited.
+    Returns 202 with the run id, which resolves at GET /runs/{id}.
+
+    Unlike the webhook this endpoint is not signed by GitHub, so it is the one
+    place an outsider could otherwise start arbitrary work on arbitrary
+    repositories (plan2.md §22 F8, §9).
     """
+    _require_api_token(authorization, x_agent_token)
+    _check_repo_allowed(req.repo)
+    _check_rate_limit(request.client.host if request.client else "unknown")
+
     from workers.tasks import run_issue
-    async_result = run_issue.delay(req.repo, req.issue_number, req.use_sandbox)
+    async_result = _enqueue_run(run_issue, req.repo, req.issue_number, req.use_sandbox)
 
     # Record the manual run request as a special webhook event for audit
     from db.session import get_session
@@ -444,6 +574,13 @@ def _selftest() -> int:
         if not cond:
             failures.append(name)
 
+    def _is_uuid(value: str) -> bool:
+        try:
+            uuid.UUID(str(value))
+            return True
+        except (ValueError, AttributeError, TypeError):
+            return False
+
     print("app/main.py self-test")
     print()
 
@@ -483,26 +620,30 @@ def _selftest() -> int:
     _get_session_factory(test_db_url)
     init_db()
 
-    # Patch the webhook secret for testing.
+    # Patch the webhook secret and API token for testing.
     global GITHUB_WEBHOOK_SECRET, MAX_WEBHOOK_BODY_BYTES
+    global AGENT_API_TOKEN, AGENT_REPO_ALLOWLIST, RUNS_RATE_LIMIT
     original_secret = GITHUB_WEBHOOK_SECRET
+    original_api_token = AGENT_API_TOKEN
     GITHUB_WEBHOOK_SECRET = secret
+    api_token = "test-agent-token-abcdef"
+    AGENT_API_TOKEN = api_token
 
     # Patch run_issue.delay to capture calls without Redis.
     enqueued: list[dict] = []
 
     class FakeAsyncResult:
-        def __init__(self, repo, number):
-            self.id = str(uuid.uuid4())
+        def __init__(self, task_id):
+            self.id = task_id
 
     import workers.tasks
-    original_delay = workers.tasks.run_issue.delay
+    original_apply_async = workers.tasks.run_issue.apply_async
 
-    def fake_delay(*args, **kwargs):
-        enqueued.append({"args": args, "kwargs": kwargs})
-        return FakeAsyncResult(args[0] if args else "?", args[1] if len(args) > 1 else 0)
+    def fake_apply_async(args=None, kwargs=None, task_id=None, **rest):
+        enqueued.append({"args": args, "kwargs": kwargs, "task_id": task_id})
+        return FakeAsyncResult(task_id)
 
-    workers.tasks.run_issue.delay = fake_delay
+    workers.tasks.run_issue.apply_async = fake_apply_async
 
     try:
         client = TestClient(app)
@@ -542,6 +683,16 @@ def _selftest() -> int:
         check("webhook returns run_id", "run_id" in r.json())
         check("task was enqueued", len(enqueued) == 1)
 
+        # F5: the run_id handed to the caller MUST be the same UUID used for the
+        # Celery task id and passed to the worker as runs.id — otherwise
+        # GET /runs/{id} and /runs/{id}/steps can never resolve it.
+        returned_id = r.json()["run_id"]
+        job = enqueued[0]
+        check("run_id == celery task_id", returned_id == job["task_id"])
+        check("run_id passed to the worker as run_id kwarg",
+              job["kwargs"].get("run_id") == returned_id)
+        check("run_id is a valid UUID", _is_uuid(returned_id), returned_id)
+
         # ── webhook: deduplication check ──────────────────────────────────
         # Send again with same delivery ID.
         r = client.post(
@@ -576,9 +727,60 @@ def _selftest() -> int:
         check("non-actionable → 204", r.status_code == 204)
 
         # ── manual trigger ───────────────────────────────────────────────
-        r = client.post("/runs", json={"repo": "test/manual", "issue_number": 7})
-        check("manual trigger → 202", r.status_code == 202)
-        check("manual trigger enqueues", len(enqueued) == 2)
+        # ── manual trigger: auth required (F8) ───────────────────────────
+        print("POST /runs authentication")
+        body = {"repo": "test/manual", "issue_number": 7}
+        auth = {"X-Agent-Token": api_token}
+
+        r = client.post("/runs", json=body)
+        check("no token → 401", r.status_code == 401, f"got {r.status_code}")
+        check("unauthenticated request not enqueued", len(enqueued) == 1)
+
+        r = client.post("/runs", json=body, headers={"X-Agent-Token": "wrong"})
+        check("wrong token → 401", r.status_code == 401, f"got {r.status_code}")
+
+        r = client.post("/runs", json=body,
+                        headers={"Authorization": f"Bearer {api_token}"})
+        check("Bearer token accepted → 202", r.status_code == 202, f"got {r.status_code}")
+
+        r = client.post("/runs", json=body, headers=auth)
+        check("X-Agent-Token accepted → 202", r.status_code == 202, f"got {r.status_code}")
+        check("manual trigger enqueues", len(enqueued) == 3)
+        check("manual trigger run_id == task_id",
+              r.json()["run_id"] == enqueued[2]["task_id"])
+
+        # ── manual trigger: repo allowlist ───────────────────────────────
+        original_allowlist = AGENT_REPO_ALLOWLIST
+        AGENT_REPO_ALLOWLIST = {"only/this"}
+        try:
+            r = client.post("/runs", json=body, headers=auth)
+            check("repo outside allowlist → 403", r.status_code == 403, f"got {r.status_code}")
+            r = client.post("/runs", json={"repo": "only/this", "issue_number": 1},
+                            headers=auth)
+            check("allowlisted repo → 202", r.status_code == 202, f"got {r.status_code}")
+        finally:
+            AGENT_REPO_ALLOWLIST = original_allowlist
+
+        # ── manual trigger: rate limit ───────────────────────────────────
+        original_limit = RUNS_RATE_LIMIT
+        RUNS_RATE_LIMIT = 2
+        _rate_buckets.clear()
+        try:
+            codes = [client.post("/runs", json=body, headers=auth).status_code
+                     for _ in range(4)]
+            check("rate limit kicks in after 2", codes == [202, 202, 429, 429], str(codes))
+        finally:
+            RUNS_RATE_LIMIT = original_limit
+            _rate_buckets.clear()
+
+        # ── manual trigger: disabled when no token is configured ─────────
+        AGENT_API_TOKEN = ""
+        try:
+            r = client.post("/runs", json=body, headers=auth)
+            check("unconfigured token → 503 (fail-closed)", r.status_code == 503,
+                  f"got {r.status_code}")
+        finally:
+            AGENT_API_TOKEN = api_token
 
         # ── M4 Database endpoints test ───────────────────────────────────
         print("M4 endpoint checks")
@@ -636,7 +838,9 @@ def _selftest() -> int:
     finally:
         # Restore originals.
         GITHUB_WEBHOOK_SECRET = original_secret
-        workers.tasks.run_issue.delay = original_delay
+        AGENT_API_TOKEN = original_api_token
+        _rate_buckets.clear()
+        workers.tasks.run_issue.apply_async = original_apply_async
         reset_singletons()
 
     print()

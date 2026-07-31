@@ -66,6 +66,9 @@ Your job is to find problems the Coder missed. Look for:
 - Regressions: Could this break existing functionality?
 - Security: Any new attack surface?
 - Style: Major deviations from the repo's conventions?
+- Test-first compliance: Does the diff include a new test that would have
+  failed before the fix? If the plan included a test_strategy and the diff
+  has no new tests, flag this as a concern.
 
 Respond with ONLY a JSON object (no extra text, no markdown fences):
 {
@@ -84,6 +87,25 @@ nits or minor formatting in an automated fix.
 # ═════════════════════════════════════════════════════════════════════════════
 # Provider helper
 # ═════════════════════════════════════════════════════════════════════════════
+
+def _accrue(budget, provider, usage) -> None:
+    """Record one model call against the shared run Budget.
+
+    Reviewer calls are real spend and must count toward the run's step/token/USD
+    caps exactly like a Coder step (plan2.md §22 F4). `budget` is duck-typed so
+    this module stays standalone for its offline self-test.
+    """
+    if budget is None:
+        return
+    try:
+        cost = provider.cost_usd(usage)
+    except Exception:
+        cost = 0.0   # a pricing glitch must never break a run
+    try:
+        budget.record(usage, cost)
+    except Exception:
+        log.warning("reviewer: could not record usage into budget", exc_info=True)
+
 
 def _get_reviewer_provider():
     """Get the LLM provider for the Reviewer agent.
@@ -137,6 +159,7 @@ def run_reviewer(
     *,
     provider=None,
     max_tokens: int = 1024,
+    budget=None,
 ) -> tuple[ReviewerOutput, Usage]:
     """Run the Reviewer agent on the Coder's output.
 
@@ -147,13 +170,20 @@ def run_reviewer(
     plan : PlannerOutput
         The Planner's structured plan that the Coder followed.
     diff : str
-        The git diff of the Coder's changes.
+        The git diff of the Coder's changes. MUST be captured against a staged
+        index (`git add -A && git diff --cached`) so files the Coder created —
+        typically the new test — are visible. A plain `git diff` omits untracked
+        files entirely (plan2.md §22 F2).
     test_output : str
-        The test results after the Coder's changes.
+        Real `run_tests` output from the Coder's trace — not its prose summary
+        (plan2.md §22 F11).
     provider : LLMProvider, optional
         Override the provider. If None, uses REVIEWER_PROVIDER / LLM_PROVIDER.
     max_tokens : int
         Max output tokens for the LLM call.
+    budget : Budget, optional
+        Shared run budget. When given, the Reviewer's model call is accrued into
+        it so Reviewer spend counts toward the run's caps (plan2.md §22 F4).
 
     Returns
     -------
@@ -198,13 +228,17 @@ def run_reviewer(
         )
     except ProviderError as e:
         log.error("reviewer: provider error: %s", e)
-        # On provider failure, default to approve so the pipeline doesn't block.
+        # Fail open so the pipeline doesn't block, but flag the review as
+        # unavailable so a reader can tell this apart from a real approval
+        # (plan2.md §16 D18, §22 F15).
         return ReviewerOutput(
             verdict="approve",
             summary=f"Review skipped due to provider error: {e}",
             confidence="low",
+            review_status="unavailable",
         ), Usage()
 
+    _accrue(budget, provider, resp.usage)
     review = ReviewerOutput.from_llm_text(resp.text)
 
     log.info("reviewer: verdict=%s, confidence=%s, concerns=%d",
@@ -216,14 +250,26 @@ def build_feedback_task(
     issue_text: str,
     plan: PlannerOutput,
     review: ReviewerOutput,
+    prior_diff: str = "",
+    prior_summary: str = "",
 ) -> str:
     """Build a task string for the Coder that incorporates reviewer feedback.
 
     When the Reviewer requests changes, the orchestrator calls this to create
-    the feedback prompt that gets fed back to the Coder for a second pass.
+    the feedback prompt for a second pass.
+
+    `prior_diff` and `prior_summary` matter: the Coder re-runs through a fresh
+    ReAct loop with an empty message history, so without them it has no memory
+    of what it just did and has to re-derive the whole change from scratch —
+    burning budget that the run may not have, and risking undoing its own work
+    (plan2.md §22 F13). Passing the diff makes the second pass an edit rather
+    than a rediscovery.
     """
     lines = [
-        "A code reviewer has requested changes to your previous fix.",
+        "You previously made a fix, and a code reviewer has requested changes.",
+        "The changes you already made are ALREADY APPLIED to the working tree —",
+        "do not redo them. Read the diff below, then make only the additional",
+        "edits needed to address the reviewer's concerns.",
         "",
         "=== REVIEWER FEEDBACK ===",
         f"Verdict: {review.verdict}",
@@ -234,10 +280,21 @@ def build_feedback_task(
         lines.append("Concerns:")
         for i, concern in enumerate(review.concerns, 1):
             lines.append(f"  {i}. {concern}")
+
+    if prior_summary:
+        lines.extend(["", "=== WHAT YOU DID LAST ROUND ===", prior_summary.strip()])
+
+    if prior_diff:
+        lines.extend([
+            "",
+            "=== YOUR CHANGES SO FAR (already on disk) ===",
+            prior_diff[:8000],
+        ])
+
     lines.extend([
         "",
-        "Please address EACH concern listed above. Read the relevant files,",
-        "make the necessary changes, and run the tests again.",
+        "Address EACH concern listed above, then run the tests again.",
+        "Keep the Red→Green evidence headings in your final summary if you have them.",
         "",
         "=== ORIGINAL CONTEXT ===",
         issue_text,

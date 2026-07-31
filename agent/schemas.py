@@ -178,6 +178,15 @@ class ReviewerOutput:
     summary: str = ""
     """1-2 sentence overall assessment."""
 
+    review_status: str = "reviewed"
+    """'reviewed' if a model actually judged the diff, 'unavailable' if the
+    review could not be performed (provider error, unparseable output).
+
+    The Reviewer deliberately fails OPEN — a broken reviewer must never block a
+    PR — but that means `verdict` reads 'approve' on every degraded path. Without
+    this field an unreviewed PR is indistinguishable from an approved one, which
+    is exactly the silent degradation G8 forbids (plan2.md §16 D18, §22 F15)."""
+
     def to_dict(self) -> dict:
         """JSON-serializable dict for DB persistence and API responses."""
         return asdict(self)
@@ -193,12 +202,21 @@ class ReviewerOutput:
         confidence = str(data.get("confidence", "medium")).strip().lower()
         if confidence not in ("high", "medium", "low"):
             confidence = "medium"
+        review_status = str(data.get("review_status", "reviewed")).strip().lower()
+        if review_status not in ("reviewed", "unavailable"):
+            review_status = "reviewed"
         return cls(
             verdict=verdict,
             concerns=_ensure_str_list(data.get("concerns")),
             confidence=confidence,
             summary=str(data.get("summary", "")),
+            review_status=review_status,
         )
+
+    @property
+    def was_reviewed(self) -> bool:
+        """True only if a model actually judged the diff."""
+        return self.review_status == "reviewed"
 
     @classmethod
     def from_llm_text(cls, text: str) -> ReviewerOutput:
@@ -212,9 +230,16 @@ class ReviewerOutput:
             return cls.from_dict(data)
 
         # Fallback: couldn't extract JSON.  Default to approve so the pipeline
-        # doesn't block.  The raw text is preserved in the step trace.
-        log.warning("could not parse ReviewerOutput JSON; defaulting to approve")
-        return cls(verdict="approve", summary=text.strip()[:500])
+        # doesn't block — but mark the review as unavailable so nobody mistakes
+        # this for a real approval (D18 / §22 F15).  The raw text is preserved
+        # in the step trace.
+        log.warning("could not parse ReviewerOutput JSON; approving as UNAVAILABLE")
+        return cls(
+            verdict="approve",
+            summary=text.strip()[:500],
+            confidence="low",
+            review_status="unavailable",
+        )
 
     @property
     def approved(self) -> bool:

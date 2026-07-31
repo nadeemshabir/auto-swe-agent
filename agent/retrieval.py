@@ -326,6 +326,29 @@ def embed_chunk(code: str) -> list[float]:
 #  — index into ChromaDB
 # ───────────────────────────────────────────────────────────────────────────
 
+def drop_repo(root: str) -> bool:
+    """Delete every chunk indexed under `root` from the vector store.
+
+    Each run indexes from a fresh ephemeral workspace
+    (${WORKSPACE_ROOT}/${run_id}/repo), so without this the collection keeps a
+    complete copy of the repository for every run ever executed — the workspace
+    is deleted but its vectors are not (plan2.md §22 F9).
+
+    Called from the orchestrator's cleanup. Best-effort: a failure here must
+    never fail a run that has already produced a PR. Returns True on success.
+
+    NOTE: this makes the index per-run and therefore re-embeds the whole repo on
+    every issue. Keying the index on the repo slug so it persists and is truly
+    incremental is the better long-term answer — see DECISION D19.
+    """
+    try:
+        get_collection().delete(where={'repo': os.path.abspath(root)})
+        return True
+    except Exception as e:
+        log.warning("could not drop index for %s: %s", root, e)
+        return False
+
+
 def index_repo(root: str):
     """Walk repo, parse, embed, store every chunk in ChromaDB.
 

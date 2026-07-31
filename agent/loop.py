@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -61,6 +62,28 @@ RUN_TESTS_TIMEOUT     = 300       # seconds
 RETRIEVE_TOKEN_BUDGET = 4_000     # context packed per retrieve_context call
 
 
+# Red/Green evidence headings in the Coder's final summary. Tolerant of the
+# heading level, the optional parenthetical, and trailing punctuation, because
+# models are inconsistent about all three.
+_EVIDENCE_HEADING_RE = re.compile(
+    r"^[ \t]*#{1,6}[ \t]*(?P<kind>Red|Green)\b[^\n]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _strip_code_fence(text: str) -> str:
+    """Drop one wrapping ``` fence, if the model added one."""
+    if not text.startswith("```"):
+        return text
+    body = text[3:]
+    newline = body.find("\n")
+    if newline != -1:
+        body = body[newline + 1:]      # discard an info string like ```text
+    if body.rstrip().endswith("```"):
+        body = body.rstrip()[:-3]
+    return body.strip()
+
+
 DEFAULT_SYSTEM = """\
 You are an autonomous software engineer working inside a single repository.
 
@@ -79,6 +102,21 @@ Working rules:
 - Make the minimal change that fixes the task. Do not refactor unrelated code,
   reformat files, or add features that were not requested.
 - Always read a file (and confirm the exact text) before you edit it.
+- TEST-FIRST WORKFLOW: When the repair plan includes a test strategy:
+    1. FIRST write the test(s) described in the plan's test_strategy.
+    2. Run the test(s) and confirm they FAIL (Red). This proves the test
+       describes behavior not yet implemented — whether it is a bug fix or
+       a new feature. Record the failure output.
+    3. THEN write the code fix / feature implementation.
+    4. Run the test(s) again and confirm they PASS (Green).
+    5. In your final summary, include both the Red (failing) and Green
+       (passing) test outputs under these exact headings:
+       ### Red (before fix)
+       <paste failing test output here>
+       ### Green (after fix)
+       <paste passing test output here>
+  If there is no test_strategy in the plan, just fix the code and run
+  existing tests as usual.
 - After editing, run the tests and fix any failures you introduced.
 - You are running autonomously and cannot ask the user questions mid-task. For
   reversible decisions that follow from the task, just proceed.
@@ -490,6 +528,42 @@ class ReActAgent:
         # if it edits a file not in this list.  Non-blocking — the edit still
         # proceeds, but the deviation is visible in the step trace.
         self._files_to_touch: list[str] | None = None
+        # Edits outside files_to_touch, in order. Surfaced to the model, the
+        # step trace, the Reviewer, and the PR body (plan2.md §22 F12).
+        self.plan_deviations: list[str] = []
+        # Most recent run_tests output, at full length. The step trace clips
+        # tool results to 300 chars, which is too short to review against, so
+        # the Reviewer reads this instead of the Coder's prose summary.
+        self.last_test_output: str = ""
+
+    def _plan_deviation(self, path: str | None) -> str | None:
+        """Return a description if `path` is outside the plan's files_to_touch.
+
+        Paths are compared after resolving them against the workspace, because
+        the Planner writes "src/parser.py" while the model may pass
+        "./src/parser.py" or an absolute path — a plain string comparison flags
+        all three as deviations and the guardrail cries wolf (plan2.md §22 F12).
+
+        Returns None when the edit is in-plan, when no plan was supplied, or
+        when the plan named no files (an empty list constrains nothing).
+        """
+        if not path or not self._files_to_touch:
+            return None
+        try:
+            target = _safe_path(self.workspace, path)
+        except ToolError:
+            return None   # the handler will reject it with a better message
+        allowed = set()
+        for entry in self._files_to_touch:
+            try:
+                allowed.add(_safe_path(self.workspace, entry))
+            except ToolError:
+                continue  # a plan path outside the workspace can never match
+        if target in allowed:
+            return None
+        rel = target.relative_to(self.workspace) if self.workspace in target.parents else target
+        return (f"edited {rel}, which the plan did not list in files_to_touch "
+                f"({', '.join(self._files_to_touch)})")
 
     # ── tool dispatch ─────────────────────────────────────────────────────────
     #tool dispatch: a function that takes a tool call and returns the result of the tool call
@@ -500,21 +574,27 @@ class ReActAgent:
             return (f"unknown tool: {call.name}", True)
         _, handler = entry
 
-        # Multi-agent guardrail: warn (don't block) if the Coder edits a file
-        # outside the Planner's files_to_touch list.  The edit proceeds, but
-        # the deviation is logged and visible in the step trace for the
-        # Reviewer to catch.
-        if (self._files_to_touch is not None
-                and call.name == "edit_file"
-                and (call.args or {}).get("path")):
-            path = (call.args or {}).get("path", "")
-            if path and path not in self._files_to_touch:
-                log.warning("coder editing %s which is NOT in the plan's files_to_touch: %s",
-                            path, self._files_to_touch)
+        # Multi-agent guardrail: flag (don't block) an edit to a file outside
+        # the Planner's files_to_touch list.
+        deviation = None
+        if call.name == "edit_file" and self._files_to_touch is not None:
+            deviation = self._plan_deviation((call.args or {}).get("path"))
+            if deviation:
+                log.warning("coder deviated from the plan: %s", deviation)
+                self.plan_deviations.append(deviation)
 
         try:
             result = handler(call.args or {})
-            return (_clip(str(result), MAX_TOOL_RESULT_CHARS), False)
+            content = _clip(str(result), MAX_TOOL_RESULT_CHARS)
+            if call.name == "run_tests":
+                self.last_test_output = content
+            if deviation:
+                # Surface the deviation to the model AND into the step trace, so
+                # it is visible to the Reviewer and in the PR — the plan says the
+                # Coder "must flag this back rather than silently doing it", and
+                # a log line reaches nobody (plan2.md §22 F12).
+                content = f"{content}\n\n[PLAN DEVIATION] {deviation}"
+            return (content, False)
         except ToolError as e:
             return (str(e), True)
         except Exception as e:  # defensive: a buggy tool must not kill the loop
@@ -656,7 +736,8 @@ class ReActAgent:
 
         The resulting prompt tells the Coder what to fix, which files to touch,
         and in what order — while the original issue text is preserved below
-        for full context."""
+        for full context.  When the plan includes a test_strategy, an explicit
+        TEST-FIRST INSTRUCTIONS block is injected to trigger Red→Green TDD."""
         parts = [
             "A Planning agent has analyzed this issue and produced the following",
             "structured repair plan. Follow the plan steps in order. Only modify",
@@ -671,14 +752,75 @@ class ReActAgent:
         ]
         for i, step in enumerate(getattr(plan, 'plan_steps', []), 1):
             parts.append(f"  {i}. {step}")
+        parts.append(f"Test strategy: {getattr(plan, 'test_strategy', '')}")
+
+        # Inject explicit test-first instructions when a test_strategy exists.
+        test_strategy = getattr(plan, 'test_strategy', '').strip()
+        if test_strategy:
+            parts.extend([
+                "",
+                "=== TEST-FIRST INSTRUCTIONS ===",
+                "IMPORTANT: Follow the Red→Green workflow for this fix:",
+                f"1. FIRST, write the test(s): {test_strategy}",
+                "2. Run them — they MUST FAIL (this proves the test describes",
+                "   behavior not yet implemented, whether it is a bug fix or a new feature).",
+                "3. Then write the code fix / feature implementation.",
+                "4. Run the tests again — they MUST PASS.",
+                "5. In your final summary, include both the failing and passing test",
+                "   outputs under these exact headings:",
+                "   ### Red (before fix)",
+                "   <paste failing test output>",
+                "   ### Green (after fix)",
+                "   <paste passing test output>",
+            ])
+
         parts.extend([
-            f"Test strategy: {getattr(plan, 'test_strategy', '')}",
             f"Risk notes: {getattr(plan, 'risk_notes', '')}",
             "",
             "=== ORIGINAL ISSUE ===",
             task,
         ])
         return "\n".join(parts)
+
+    @staticmethod
+    def extract_test_evidence(final_text: str) -> dict:
+        """Extract Red/Green test evidence from the Coder's final summary.
+
+        The Coder is instructed to include '### Red (before fix)' and
+        '### Green (after fix)' sections in its final summary.  This method
+        extracts them for inclusion in the PR body.
+
+        Returns
+        -------
+        dict
+            {"red": "...", "green": "..."} with empty strings if not found.
+        """
+        evidence = {"red": "", "green": ""}
+        if not final_text:
+            return evidence
+
+        # One pass over the headings, in the order they actually appear, so the
+        # sections are delimited by their neighbours rather than by arithmetic
+        # on marker lengths. The previous implementation subtracted a fixed
+        # marker length from an offset that may have been found with a marker of
+        # a different length, which could run backwards past the start of the
+        # section — and it assumed Red always preceded Green (plan2.md §22 F14).
+        matches = [
+            (m.start(), m.end(), m.group("kind").lower())
+            for m in _EVIDENCE_HEADING_RE.finditer(final_text)
+        ]
+        if not matches:
+            return evidence
+
+        for i, (_, body_start, kind) in enumerate(matches):
+            body_end = matches[i + 1][0] if i + 1 < len(matches) else len(final_text)
+            section = final_text[body_start:body_end].strip()
+            # Last heading of a kind wins, so a model that restates its results
+            # reports the final state.
+            if kind in evidence and section:
+                evidence[kind] = _strip_code_fence(section)
+
+        return evidence
 
 
 # ═════════════════════════════════════════════════════════════════════════════

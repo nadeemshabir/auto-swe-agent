@@ -75,7 +75,7 @@ Respond with ONLY a JSON object in this exact format (no extra text):
     "Step 1: ...",
     "Step 2: ..."
   ],
-  "test_strategy": "description of what tests to add or run",
+  "test_strategy": "Specific test to write FIRST: name the test file, function name, input, and expected behavior. Example: 'Add test_parse_empty_string() in tests/test_parser.py that calls parse_json(\"\") and asserts it returns None instead of raising IndexError.' Be concrete enough that a Coder agent can write the test immediately without guessing.",
   "risk_notes": "edge cases, potential breaking changes, or 'None'"
 }
 
@@ -123,6 +123,28 @@ def _get_planner_provider():
 # Retrieval helper
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _accrue(budget, provider, usage) -> None:
+    """Record one model call against the shared run Budget.
+
+    Planner calls are real spend and must count toward the run's step/token/USD
+    caps exactly like a Coder step — otherwise two of the three agents run
+    uncapped and the reported cost understates reality (plan2.md §22 F4).
+
+    `budget` is duck-typed (anything with `.record(usage, cost)`) so this module
+    stays standalone and its offline self-test needs no Budget import.
+    """
+    if budget is None:
+        return
+    try:
+        cost = provider.cost_usd(usage)
+    except Exception:
+        cost = 0.0   # a pricing glitch must never break a run
+    try:
+        budget.record(usage, cost)
+    except Exception:
+        log.warning("planner: could not record usage into budget", exc_info=True)
+
+
 def _retrieve_context(workspace: str | Path, issue_text: str,
                       k: int = PLANNER_RETRIEVAL_K,
                       token_budget: int = PLANNER_TOKEN_BUDGET) -> str:
@@ -159,6 +181,7 @@ def run_planner(
     retrieval_budget: int = PLANNER_TOKEN_BUDGET,
     max_tokens: int = 2048,
     skip_retrieval: bool = False,
+    budget=None,
 ) -> tuple[PlannerOutput, Usage]:
     """Run the Planner agent.
 
@@ -178,6 +201,11 @@ def run_planner(
         Max output tokens for the LLM call.
     skip_retrieval : bool
         If True, skip retrieval (for testing or when the index isn't built).
+        Leave this False in the real pipeline — a Planner that has not seen the
+        codebase guesses `files_to_touch` from the issue title alone.
+    budget : Budget, optional
+        Shared run budget. When given, every Planner model call is accrued into
+        it so Planner spend counts toward the run's caps (plan2.md §22 F4).
 
     Returns
     -------
@@ -215,6 +243,7 @@ def run_planner(
         return PlannerOutput(understanding=f"Planner failed: {e}"), Usage()
 
     total_usage = total_usage + resp.usage
+    _accrue(budget, provider, resp.usage)
     plan = PlannerOutput.from_llm_text(resp.text)
 
     # If parsing got structured steps, we have a real plan — done.
@@ -237,6 +266,7 @@ def run_planner(
             max_tokens=max_tokens,
         )
         total_usage = total_usage + resp2.usage
+        _accrue(budget, provider, resp2.usage)
         plan = PlannerOutput.from_llm_text(resp2.text)
     except ProviderError as e:
         log.error("planner: provider error on retry: %s", e)

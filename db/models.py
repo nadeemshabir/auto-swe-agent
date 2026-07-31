@@ -32,6 +32,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -55,12 +56,25 @@ def _utcnow() -> datetime:
 # ── runs ─────────────────────────────────────────────────────────────────────
 
 class Run(Base):
-    """One row per autonomous agent run (one issue = one run).
+    """One row per autonomous agent run.
 
-    Statuses match plan2.md §7.1:
-        queued, running, completed, no_changes, refused,
-        budget_exhausted, provider_error, sandbox_error,
-        github_error, index_error, error
+    **Append-only** (plan2.md §16 D16): re-running an issue inserts a NEW row and
+    keeps the old one, so a run's history survives. The table previously carried
+    a unique constraint on (repo, issue_number), which meant only one run per
+    issue could ever exist — re-running destroyed the audit trail the whole
+    persistence layer exists to provide (§22 F10).
+
+    Idempotency is instead enforced by a *partial* unique index over
+    (repo, issue_number) restricted to status='running': at most one ACTIVE run
+    per issue, any number of finished ones. Because the database enforces it,
+    two workers racing on the same issue cannot both start — the loser gets an
+    IntegrityError and stands down, with no application-level lock needed.
+
+    Statuses:
+        queued, running, completed, no_changes, refused, max_steps,
+        token_budget, usd_budget, max_tokens, provider_error, sandbox_error,
+        github_error, index_error, error, skipped_duplicate,
+        stale  — abandoned by a crashed worker and reaped (see §13)
     """
 
     __tablename__ = "runs"
@@ -93,15 +107,25 @@ class Run(Base):
     # Nullable for backward compatibility with pre-multi-agent runs.
     planner_output  = Column(PortableJSON, nullable=True)  # PlannerOutput.to_dict()
     reviewer_output = Column(PortableJSON, nullable=True)  # Last ReviewerOutput.to_dict()
+    test_evidence   = Column(PortableJSON, nullable=True)  # {"red": "...", "green": "..."}
 
     # Relationships
     steps = relationship("RunStep", back_populates="run", order_by="RunStep.n",
                          cascade="all, delete-orphan")
 
-    # Idempotency: only one active run per (repo, issue_number).
-    # Re-runs update the existing row. (plan2.md §5 G6, §7.1)
+    # Idempotency: at most one ACTIVE run per (repo, issue_number). Finished
+    # runs accumulate freely, so history is preserved. (plan2.md §5 G6, §7.1, D16)
+    #
+    # Partial indexes are supported by both Postgres and SQLite (3.8+), so the
+    # same guarantee holds in tests as in production.
     __table_args__ = (
-        UniqueConstraint("repo", "issue_number", name="uq_runs_repo_issue"),
+        Index(
+            "uq_runs_active_issue",
+            "repo", "issue_number",
+            unique=True,
+            postgresql_where=text("status = 'running'"),
+            sqlite_where=text("status = 'running'"),
+        ),
     )
 
     def to_dict(self) -> dict:
@@ -126,6 +150,7 @@ class Run(Base):
             "error_detail": self.error_detail,
             "planner_output": self.planner_output,
             "reviewer_output": self.reviewer_output,
+            "test_evidence": self.test_evidence,
         }
 
 
@@ -315,23 +340,45 @@ def _selftest() -> int:
         check("webhook event inserted", fetched_evt is not None)
         check("webhook action correct", fetched_evt.action_taken == "enqueued")
 
-    # ── 5. Test idempotency constraint ───────────────────────────────────
-    print("idempotency constraint")
+    # ── 5. Test idempotency: one ACTIVE run, many finished ones ──────────
+    # The seeded run above is status='running', so a second running row for the
+    # same (repo, issue) must be rejected while a finished one is allowed —
+    # that is what makes the table append-only (D16 / §22 F10).
+    print("idempotency: partial unique index on active runs")
     from sqlalchemy.exc import IntegrityError
     with Session(engine) as session:
-        dupe = Run(
+        second_active = Run(
             repo="owner/test-repo",
             issue_number=42,
-            issue_title="Duplicate!",
-            status="queued",
+            issue_title="Concurrent attempt",
+            status="running",
         )
-        session.add(dupe)
+        session.add(second_active)
         try:
             session.commit()
-            check("duplicate (repo, issue) rejected", False, "should have raised IntegrityError")
+            check("second ACTIVE run rejected", False, "should have raised IntegrityError")
         except IntegrityError:
             session.rollback()
-            check("duplicate (repo, issue) rejected", True)
+            check("second ACTIVE run rejected", True)
+
+    with Session(engine) as session:
+        historical = Run(
+            repo="owner/test-repo",
+            issue_number=42,
+            issue_title="Earlier attempt",
+            status="completed",
+        )
+        session.add(historical)
+        try:
+            session.commit()
+            check("finished run for the same issue allowed (history kept)", True)
+        except IntegrityError:
+            session.rollback()
+            check("finished run for the same issue allowed (history kept)", False,
+                  "append-only insert was rejected")
+
+        kept = session.query(Run).filter_by(repo="owner/test-repo", issue_number=42).count()
+        check("both runs retained for the same issue", kept == 2, f"got {kept}")
 
     # ── 6. Test webhook dedupe constraint ────────────────────────────────
     with Session(engine) as session:

@@ -1,16 +1,34 @@
+# Pinned to exact versions (plan2.md §22 F16).
+#
+# Everything here was previously unpinned, so two builds of the same commit could
+# resolve different dependency versions — a reproducibility problem that becomes
+# a deployment problem the moment images are built in CI rather than on your
+# laptop (§21 Phase 1). The versions below are the set this project is known to
+# work on, captured 2026-07-30 on Python 3.12 (matching the 3.12-slim-bookworm
+# base used by all three Dockerfiles).
+#
+# To upgrade deliberately:
+#     pip install -U <pkg> && pip show <pkg>   # then update the pin below
+#     python -m pytest tests/                  # and re-run the suites
+#     for m in agent.schemas agent.planner agent.reviewer agent.loop \
+#              agent.github db.models workers.tasks app.main; do python -m $m; done
+
 # --- Week 1: codebase understanding ---
-tree-sitter>=0.21
-tree-sitter-python
-sentence-transformers
-chromadb
+tree-sitter==0.26.0
+tree-sitter-python==0.25.0
+sentence-transformers==5.6.0   # local embeddings — no API cost, no network
+chromadb==1.5.9
 
 # --- Week 3: ReAct loop + LLM providers ---
 # The agent is provider-pluggable (see docs/llm-provider-abstraction.md).
-# Install the SDK for whichever provider you use; both are listed so either works.
-anthropic>=0.40            # LLM_PROVIDER=anthropic (default, claude-opus-4-8)
-google-genai>=1.0          # LLM_PROVIDER=gemini   (gemini-2.5-pro)
-python-dotenv              # loads .env into os.environ
-pytest                     # used by the agent's run_tests tool
+# Both SDKs are listed so either LLM_PROVIDER works out of the box. Which MODEL
+# is used comes from .env (LLM_MODEL / PLANNER_MODEL / REVIEWER_MODEL) and is
+# deliberately not restated here — duplicated model names go stale
+# (plan2.md §6.6, DECISION D20).
+anthropic==0.116.0             # LLM_PROVIDER=anthropic
+google-genai==2.10.0           # LLM_PROVIDER=gemini
+python-dotenv==1.2.2           # loads .env into os.environ
+pytest==9.1.1                  # the agent's run_tests tool, and tests/
 
 # Token counting is provider-neutral and dependency-free in agent/retrieval.py
 # (a local estimate). Exact counts come from the active LLM provider's own
@@ -23,15 +41,15 @@ pytest                     # used by the agent's run_tests tool
 # `git` on PATH and GITHUB_TOKEN in the environment for live calls.
 
 # --- M1: Queue & workers ---
-celery>=5.3
-redis>=5.0
+celery==5.6.3
+redis==8.0.1
 
 # --- M3: API gateway ---
-fastapi>=0.115
-uvicorn[standard]>=0.30
-httpx                      # needed by FastAPI's TestClient for self-tests
+fastapi==0.139.0
+uvicorn[standard]==0.50.2
+httpx==0.28.1                  # FastAPI's TestClient, used by the self-tests
 
 # --- M4: Persistence & idempotency ---
-sqlalchemy>=2.0
-alembic>=1.13
-psycopg2-binary>=2.9       # PostgreSQL driver
+sqlalchemy==2.0.51
+alembic==1.18.5
+psycopg2-binary==2.9.12        # PostgreSQL driver
