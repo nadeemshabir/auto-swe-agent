@@ -163,3 +163,46 @@ def test_every_supported_provider_has_a_non_empty_default():
     assert DEFAULT_PROVIDER in DEFAULT_MODELS
     for provider, model in DEFAULT_MODELS.items():
         assert model and model.strip(), f"{provider} has no default model"
+
+
+# ── thinking parts must not leak into resp.text (§22 F23) ────────────────────
+
+def test_gemini_excludes_thinking_parts_from_text():
+    """F23: reasoning models return the chain of thought as parts with
+    thought=True. Concatenating those into resp.text fed the model's internal
+    deliberation to the Planner's JSON parser, which then failed and fell back
+    to raw text with every structured field empty."""
+    from agent.providers.gemini_provider import GeminiProvider
+
+    class P:
+        def __init__(self, text, thought=False):
+            self.text, self.thought = text, thought
+
+    parts = [
+        P("Maybe Random Utilities is a separate class. Let's plan: 1. Update", thought=True),
+        P('{"understanding": "adds utility helpers", "plan_steps": ["step 1"]}'),
+    ]
+
+    # The extraction expression as used in GeminiProvider.complete()
+    text = "".join(
+        p.text for p in parts
+        if getattr(p, "text", None) and not getattr(p, "thought", False)
+    )
+
+    assert "Let's plan" not in text, "thinking leaked into the answer text"
+    assert text.startswith("{"), f"answer should be the bare JSON object, got: {text[:60]!r}"
+
+    from agent.schemas import PlannerOutput
+    plan = PlannerOutput.from_llm_text(text)
+    assert plan.plan_steps == ["step 1"], "parsing failed on the cleaned text"
+    assert plan.understanding == "adds utility helpers"
+
+
+def test_planner_falls_back_visibly_when_given_thinking_text():
+    """The failure mode this produced: everything empty except understanding."""
+    from agent.schemas import PlannerOutput
+    plan = PlannerOutput.from_llm_text("Maybe X. Let's plan: 1. Update `utils.py`")
+    assert plan.understanding                      # raw text preserved
+    assert plan.plan_steps == []                   # ...and nothing else populated
+    assert plan.files_to_touch == []
+    assert plan.is_empty() is False                # has text, so not "empty"

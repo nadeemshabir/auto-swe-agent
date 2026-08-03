@@ -143,9 +143,24 @@ class GeminiProvider:
             candidate = (resp.candidates or [None])[0]
 
             # text (collect from parts to avoid SDK warnings when only tool calls exist)
+            #
+            # Thinking parts are EXCLUDED. Gemini's reasoning models return the
+            # chain of thought as parts carrying `thought=True`, alongside the
+            # actual answer. Concatenating both put the model's internal
+            # deliberation into resp.text, so the Planner and Reviewer — which
+            # ask for a bare JSON object — received prose like
+            #   "Maybe Random Utilities is a separate class... Let's plan: 1. ..."
+            # JSON extraction then failed, both attempts fell back to raw text,
+            # and every structured field came back empty (plan2.md §22 F23).
+            #
+            # It also silently inflated prompt size on every subsequent turn,
+            # since assistant_turn echoes the content back.
             text = ""
             if candidate is not None and candidate.content and candidate.content.parts:
-                text = "".join(p.text for p in candidate.content.parts if getattr(p, "text", None))
+                text = "".join(
+                    p.text for p in candidate.content.parts
+                    if getattr(p, "text", None) and not getattr(p, "thought", False)
+                )
 
             # tool calls
             tool_calls = []
