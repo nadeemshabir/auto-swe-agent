@@ -122,9 +122,20 @@ USER appuser
 
 # ── Healthcheck ───────────────────────────────────────────────────────────────
 # Check that the Celery worker is alive by running `celery inspect ping`.
+#
+# No --destination on purpose. The previous version used `celery@$$HOSTNAME`,
+# but in sh `$$` is the shell's PID, so that expanded to something like
+# `celery@131HOSTNAME` — a node that never exists. The check therefore failed
+# every time and the container sat permanently "unhealthy" while the worker was
+# in fact running fine. A healthcheck that can only ever fail is worse than
+# none: it trains you to ignore the status.
+#
+# Without --destination, `inspect ping` broadcasts and any responding worker
+# yields "pong", which is exactly the question being asked — is this container's
+# worker alive and reachable through the broker.
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
-    CMD celery -A workers inspect ping --destination celery@$$HOSTNAME \
-        --timeout 5 2>/dev/null | grep -q "pong" || exit 1
+    CMD celery -A workers inspect ping --timeout 5 2>/dev/null \
+        | grep -q "pong" || exit 1
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 # --concurrency=2: run 2 parallel tasks per container. Each task is a full
