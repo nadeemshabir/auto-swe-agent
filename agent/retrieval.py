@@ -511,15 +511,37 @@ def assemble_context(query: str, repo: str = None, k: int = 10, token_budget: in
     """
     Retrieve top-K chunks for `query`, pack as many as fit under `token_budget`.
     Returns one string ready to drop into an LLM prompt.
+
+    File headers are REPO-RELATIVE when `repo` is given. Chunks are indexed by
+    absolute path (see index_repo), but an absolute path is the wrong thing to
+    show a model: it is the only place the Planner learns how to spell a file,
+    so it copies the shape it sees into `files_to_touch`. Handed
+    `/var/agent/workspaces/<uuid>/repo/calculator.py`, it emitted
+    "repo/calculator.py" — which then resolved one level below the workspace and
+    made every single edit look like it was outside the plan (plan2.md §22 F12).
+
+    Relative paths are also what the Coder's edit_file takes, so this keeps one
+    spelling of a path across all three agents — and keeps a throwaway workspace
+    UUID out of the prompt.
     """
     chunks = retrieve(query, repo=repo, k=k)
+    root = os.path.abspath(repo) if repo else None
 
     out_parts = []
     used = 0
 
     for c in chunks:
         md = c.get('metadata') or {}   # tolerate chunks with missing metadata
-        header = f"\n# {md.get('file', '?')} (lines {md.get('start_line', '?')}-{md.get('end_line', '?')})\n"
+        fpath = md.get('file', '?')
+        if root and isinstance(fpath, str) and fpath != '?':
+            try:
+                # Only rewrite paths that really live under the repo; relpath
+                # would happily return '../../..' for anything else.
+                if os.path.commonpath([root, os.path.abspath(fpath)]) == root:
+                    fpath = os.path.relpath(fpath, root)
+            except ValueError:
+                pass   # different drives on Windows — leave it absolute
+        header = f"\n# {fpath} (lines {md.get('start_line', '?')}-{md.get('end_line', '?')})\n"
         block  = header + c['code']
         cost   = count_tokens(block)
 

@@ -36,7 +36,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # Load .env so that ANTHROPIC_API_KEY, LLM_PROVIDER, budget limits etc.
 # are visible to os.getenv() throughout the process.
@@ -603,6 +603,19 @@ class ReActAgent:
         "./src/parser.py" or an absolute path — a plain string comparison flags
         all three as deviations and the guardrail cries wolf (plan2.md §22 F12).
 
+        Resolution alone is not enough. The Planner can also name a file with a
+        LEADING prefix that isn't part of the repo-relative path — "repo/x.py"
+        when it saw an absolute workspace path in its retrieved context. That
+        resolves a level too deep, matches nothing, and flags every edit. So
+        after the exact check we compare path components suffix-wise, which
+        makes "repo/x.py", "x.py" and "./x.py" all agree while still
+        distinguishing "src/utils.py" from "tests/utils.py".
+
+        The suffix rule is deliberately the loose direction: this guardrail is
+        advisory (it annotates the trace and tells the model), so a missed
+        deviation is far cheaper than a false one that trains the Coder to
+        ignore the warning.
+
         Returns None when the edit is in-plan, when no plan was supplied, or
         when the plan named no files (an empty list constrains nothing).
         """
@@ -612,6 +625,7 @@ class ReActAgent:
             target = _safe_path(self.workspace, path)
         except ToolError:
             return None   # the handler will reject it with a better message
+
         allowed = set()
         for entry in self._files_to_touch:
             try:
@@ -620,9 +634,30 @@ class ReActAgent:
                 continue  # a plan path outside the workspace can never match
         if target in allowed:
             return None
+
         rel = target.relative_to(self.workspace) if self.workspace in target.parents else target
+        if self._matches_loosely(rel, self._files_to_touch):
+            return None
+
         return (f"edited {rel}, which the plan did not list in files_to_touch "
                 f"({', '.join(self._files_to_touch)})")
+
+    @staticmethod
+    def _matches_loosely(rel: Path, entries: list[str]) -> bool:
+        """True if `rel` is the same file as some plan entry, ignoring a
+        leading prefix on either side. Compares whole path components, so
+        'utils.py' never matches 'my_utils.py'."""
+        target = tuple(p for p in PurePosixPath(rel.as_posix()).parts if p != ".")
+        if not target:
+            return False
+        for entry in entries:
+            parts = tuple(p for p in PurePosixPath(entry).parts if p != ".")
+            if not parts:
+                continue
+            n = min(len(parts), len(target))
+            if parts[-n:] == target[-n:]:
+                return True
+        return False
 
     # ── tool dispatch ─────────────────────────────────────────────────────────
     #tool dispatch: a function that takes a tool call and returns the result of the tool call

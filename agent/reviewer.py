@@ -35,11 +35,15 @@ except ImportError:
     pass
 
 try:
-    from .providers import ProviderError, Usage, get_provider_for_role
+    from .providers import (
+        ProviderError, Usage, get_fallback_for_role, get_provider_for_role,
+    )
     from .schemas import PlannerOutput, ReviewerOutput
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from agent.providers import ProviderError, Usage, get_provider_for_role
+    from agent.providers import (
+        ProviderError, Usage, get_fallback_for_role, get_provider_for_role,
+    )
     from agent.schemas import PlannerOutput, ReviewerOutput
 
 log = logging.getLogger("agent.reviewer")
@@ -135,6 +139,8 @@ def run_reviewer(
     provider=None,
     max_tokens: int = 1024,
     budget=None,
+    fallback_provider=None,
+    on_model_switch=None,
 ) -> tuple[ReviewerOutput, Usage]:
     """Run the Reviewer agent on the Coder's output.
 
@@ -159,12 +165,20 @@ def run_reviewer(
     budget : Budget, optional
         Shared run budget. When given, the Reviewer's model call is accrued into
         it so Reviewer spend counts toward the run's caps (plan2.md §22 F4).
+    fallback_provider : LLMProvider, optional
+        Model to retry on when the configured one returns no usable review. If
+        omitted, one is resolved from FALLBACK_MODELS — but ONLY when `provider`
+        was not supplied by the caller, matching run_planner (§22 F24).
+    on_model_switch : callable, optional
+        Called as (agent_name, old_model, new_model, reason) when the Reviewer
+        falls back, so the caller can make the degradation visible.
 
     Returns
     -------
     tuple[ReviewerOutput, Usage]
         The review verdict and token usage for budget tracking.
     """
+    caller_supplied_provider = provider is not None
     provider = provider or _get_reviewer_provider()
 
     # Build the user message with all context the Reviewer needs.
@@ -192,33 +206,85 @@ def run_reviewer(
     ])
 
     user_text = "\n".join(parts)
-    messages = [provider.user_message(user_text)]
 
+    total_usage = Usage()
+
+    # Attempt with the configured model, then — if that produced no usable
+    # review — once more on the fallback model.
+    #
+    # The Reviewer needs this MORE than the Planner does, not less. An
+    # unparseable plan is loudly empty; an unparseable review silently becomes
+    # `approve` with review_status="unavailable" (D18/F15), so the pipeline
+    # opens a PR that nothing actually reviewed. That is the failure mode the
+    # gate exists to prevent, so it is worth one retry on a duller model that
+    # answers in clean JSON before we give up and fail open.
+    review, usage, err = _attempt(provider, user_text, max_tokens, budget, "configured")
+    total_usage = total_usage + usage
+
+    if not review.was_reviewed:
+        fallback = fallback_provider
+        if fallback is None and not caller_supplied_provider:
+            fallback = get_fallback_for_role("reviewer")
+        if fallback is not None:
+            old_model = getattr(provider, "model", "?")
+            new_model = getattr(fallback, "model", "?")
+            reason = f"provider error ({err})" if err else "returned no usable review"
+            log.warning("reviewer: configured model %s — retrying on the "
+                        "fallback model", reason)
+            if on_model_switch is not None:
+                # Never let a notification failure affect the run.
+                try:
+                    on_model_switch("Reviewer", old_model, new_model, reason)
+                except Exception:
+                    log.warning("reviewer: could not announce model switch",
+                                exc_info=True)
+            fb_review, fb_usage, fb_err = _attempt(
+                fallback, user_text, max_tokens, budget, "fallback")
+            total_usage = total_usage + fb_usage
+            if fb_review.was_reviewed:
+                review = fb_review
+            elif fb_err and not err:
+                # Keep whichever attempt at least produced text to look at.
+                review = review
+            else:
+                review = fb_review
+
+    log.info("reviewer: verdict=%s, confidence=%s, concerns=%d, status=%s",
+             review.verdict, review.confidence, len(review.concerns),
+             review.review_status)
+    return review, total_usage
+
+
+def _attempt(provider, user_text: str, max_tokens: int, budget,
+             label: str) -> tuple[ReviewerOutput, Usage, str]:
+    """One model's shot at reviewing.
+
+    Returns (review, usage, error). `error` is a non-empty string only when the
+    provider itself failed, which the caller uses to describe the switch.
+    Never raises: a failed attempt returns a review flagged `unavailable` so the
+    pipeline fails open (plan2.md §16 D18, §22 F15).
+    """
     try:
         resp = provider.complete(
             system=REVIEWER_SYSTEM,
-            messages=messages,
+            messages=[provider.user_message(user_text)],
             tools=[],  # Reviewer doesn't use tools
             max_tokens=max_tokens,
         )
     except ProviderError as e:
-        log.error("reviewer: provider error: %s", e)
-        # Fail open so the pipeline doesn't block, but flag the review as
-        # unavailable so a reader can tell this apart from a real approval
-        # (plan2.md §16 D18, §22 F15).
+        log.error("reviewer[%s]: provider error: %s", label, e)
         return ReviewerOutput(
             verdict="approve",
             summary=f"Review skipped due to provider error: {e}",
             confidence="low",
             review_status="unavailable",
-        ), Usage()
+        ), Usage(), str(e)
 
     _accrue(budget, provider, resp.usage)
     review = ReviewerOutput.from_llm_text(resp.text)
-
-    log.info("reviewer: verdict=%s, confidence=%s, concerns=%d",
-             review.verdict, review.confidence, len(review.concerns))
-    return review, resp.usage
+    if not review.was_reviewed:
+        log.warning("reviewer[%s]: unparseable output", label)
+    return review, resp.usage, ""
 
 
 def build_feedback_task(

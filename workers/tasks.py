@@ -635,6 +635,7 @@ def run_issue(
                     last_review, rev_usage = run_reviewer(
                         issue.to_task(), plan, diff_text, test_output,
                         budget=budget,
+                        on_model_switch=_announce_model_switch,
                     )
                     _persist_agent_step(db_session, run_id, _global_step_n,
                                         "reviewer", last_review.to_dict(), rev_usage)
