@@ -415,6 +415,42 @@ def run_issue(
         from agent.reviewer import build_feedback_task, run_reviewer
         from agent.schemas import PlannerOutput, ReviewerOutput
 
+        # ── 1b. Acknowledge immediately ──────────────────────────────────
+        # Posted BEFORE the clone and index, which together take a while. The
+        # plan comment cannot appear until the Planner has actually read the
+        # code, so without this the issue sits silent long enough to look
+        # broken. Cheap, and it is the first signal a human gets.
+        def _say(body: str) -> None:
+            """Comment on the issue. Never let a comment failure affect a run."""
+            try:
+                client.comment_on_issue(repo, issue_number, body)
+            except Exception as e:
+                log.warning("[%s] could not comment: %s", run_id_str, e)
+
+        def _announce_model_switch(agent_name, old_model, new_model, reason):
+            """Surface a mid-run model swap on the issue.
+
+            Passed to the Planner and Coder as `on_model_switch`. They know
+            nothing about GitHub — this keeps that knowledge in the orchestrator
+            while still making a silent degradation visible to whoever is
+            watching the issue.
+            """
+            _say(
+                f"⚠️ **{agent_name}: switching models.**\n\n"
+                f"`{old_model}` is unavailable — {reason}\n\n"
+                f"Retrying on `{new_model}`. This may affect quality, and the "
+                f"PR will note it if anything looks off."
+            )
+
+        if COMMENT_ON_START:
+            _say(
+                "👋 **Got it — I'm on this.**\n\n"
+                "Cloning the repository and indexing the codebase now, then my "
+                "Planner will work out what needs to change. I'll post its "
+                "analysis here shortly, then open a PR.\n\n"
+                f"*(run `{run_id_str}`)*"
+            )
+
         # ── 2. Clone ─────────────────────────────────────────────────────
         workspace = WORKSPACE_ROOT / run_id_str / "repo"
         log.info("[%s] cloning %s into %s", run_id_str, repo, workspace)
@@ -473,6 +509,7 @@ def run_issue(
                 issue.to_task(),
                 workspace,
                 budget=budget,
+                on_model_switch=_announce_model_switch,
             )
             _persist_agent_step(db_session, run_id, _global_step_n, "planner",
                                 plan.to_dict(), planner_usage)
@@ -490,33 +527,39 @@ def run_issue(
         except Exception as e:
             log.warning("[%s] Planner failed (continuing with empty plan): %s", run_id_str, e)
 
-        # ── 6. Pre-work comment using the Planner's understanding ─────────
+        # ── 6. Post the plan — the follow-up to the acknowledgement ───────
         if COMMENT_ON_START:
-            try:
-                steps_str = ""
-                if plan.plan_steps:
-                    steps_str = "\n".join(f"- {s}" for s in plan.plan_steps)
-                    steps_str = f"\n\n**Plan:**\n{steps_str}"
+            if plan.plan_steps:
+                steps_str = "\n".join(f"{i}. {s}" for i, s in
+                                      enumerate(plan.plan_steps, 1))
                 root_cause = (
-                    f"\n\n**Root cause hypothesis:**\n{plan.root_cause_hypothesis}"
+                    f"\n\n**Why I think it's happening:**\n{plan.root_cause_hypothesis}"
                     if plan.root_cause_hypothesis else ""
                 )
-                comment_body = (
-                    f"🤖 **Auto-SWE agent is investigating this issue.**\n\n"
-                    f"**My understanding:**\n{plan.understanding or 'Analysing...'}\n"
-                    f"{root_cause}{steps_str}\n\n"
-                    f"I will open a PR shortly. *(run `{run_id_str}`)*"
+                files_str = (
+                    "\n\n**Files I expect to touch:** "
+                    + ", ".join(f"`{f}`" for f in plan.files_to_touch)
+                    if plan.files_to_touch else ""
                 )
-                client.comment_on_issue(repo, issue_number, comment_body)
-            except Exception as e:
-                log.warning("[%s] pre-work comment failed: %s", run_id_str, e)
-                try:
-                    client.comment_on_issue(
-                        repo, issue_number,
-                        f"🤖 Auto-SWE agent is working on this issue. (run `{run_id_str}`)"
-                    )
-                except GitHubError as github_err:
-                    log.warning("[%s] could not post start comment: %s", run_id_str, github_err)
+                _say(
+                    f"🔍 **Here's what I found.**\n\n"
+                    f"**What I think you're asking for:**\n{plan.understanding}"
+                    f"{root_cause}{files_str}\n\n"
+                    f"**My plan:**\n{steps_str}\n\n"
+                    f"Writing the code now — I'll open a PR when the tests pass."
+                )
+            else:
+                # The Planner produced nothing usable even after its fallback.
+                # Say so rather than posting a confident-looking empty plan —
+                # the Coder is about to work without one, and that is worth
+                # knowing when reviewing whatever PR appears.
+                _say(
+                    "🔍 **I couldn't produce a structured plan for this one.**\n\n"
+                    "I'll still attempt a fix, working straight from the issue "
+                    "text — but treat the resulting PR with extra scepticism, "
+                    "and consider rewording the issue to be narrower and more "
+                    "specific if the result misses the mark."
+                )
 
         # ── 7. (Optional) Start sandbox ──────────────────────────────────
         if use_sandbox:
@@ -545,6 +588,7 @@ def run_issue(
                 auto_index=False,   # already indexed in step 4
                 sandbox=sandbox,
                 budget=budget,      # shared with Planner + Reviewer (F4)
+                on_model_switch=_announce_model_switch,
             )
             agent_result: RunResult = agent.run_with_plan(issue.to_task(), plan)
         except (ProviderError, ValueError) as e:

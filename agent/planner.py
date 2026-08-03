@@ -174,6 +174,7 @@ def run_planner(
     skip_retrieval: bool = False,
     budget=None,
     fallback_provider=None,
+    on_model_switch=None,
 ) -> tuple[PlannerOutput, Usage]:
     """Run the Planner agent.
 
@@ -202,6 +203,9 @@ def run_planner(
         Model to retry on when the configured one yields no usable plan. If
         omitted, one is resolved from FALLBACK_MODELS — but ONLY when `provider`
         was not supplied by the caller (§22 F24).
+    on_model_switch : callable, optional
+        Called as (agent_name, old_model, new_model, reason) when the Planner
+        falls back, so the caller can make the degradation visible.
 
     Returns
     -------
@@ -244,8 +248,19 @@ def run_planner(
         if fallback is None and not caller_supplied_provider:
             fallback = get_fallback_for_role("planner")
         if fallback is not None:
+            old_model = getattr(provider, "model", "?")
+            new_model = getattr(fallback, "model", "?")
             log.warning("planner: configured model produced no usable plan — "
                         "retrying on the fallback model")
+            if on_model_switch is not None:
+                # Let the orchestrator surface this on the issue. Never let a
+                # notification failure affect the run.
+                try:
+                    on_model_switch("Planner", old_model, new_model,
+                                    "produced no usable plan")
+                except Exception:
+                    log.warning("planner: could not announce model switch",
+                                exc_info=True)
             fb_plan, fb_usage, fb_raw = _attempt(
                 fallback, user_text, max_tokens, budget, "fallback")
             total_usage = total_usage + fb_usage

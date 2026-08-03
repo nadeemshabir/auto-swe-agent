@@ -29,10 +29,14 @@ from .base import LLMResponse, ProviderError, ToolCall, ToolSpec, Usage
 log = logging.getLogger("agent.providers.gemini")
 
 # Retry settings for transient API errors (503, 429, etc.)
-# 1+2+4+8+16 = 31s of backoff was not enough for a sustained capacity outage:
-# a run died after exhausting all five inside half a minute. Env-tunable so an
-# outage can be ridden out without a redeploy.
-_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "6"))
+#
+# ONE retry, deliberately. Long in-provider backoff is the wrong answer to a
+# capacity outage: it burns wall-clock inside a single call while the caller can
+# do something far more useful — switch to a less contended model. So we retry
+# once to ride out a blip, then raise and let the agent's fallback take over
+# (agent/loop.py _switch_to_fallback, agent/planner.py). Env-tunable if you want
+# to wait longer instead.
+_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "1"))
 _RETRY_BASE_DELAY = float(os.getenv("GEMINI_RETRY_BASE_DELAY", "2.0"))
 _RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
 

@@ -53,7 +53,10 @@ class AnthropicProvider:
         self,
         model: str | None = None,
         effort: str | None = None,
-        max_retries: int = 4,
+        # One retry, then let the agent's model fallback take over rather than
+        # spending wall-clock on backoff inside a single call. See the matching
+        # note in gemini_provider.
+        max_retries: int = int(os.getenv("ANTHROPIC_MAX_RETRIES", "1")),
         timeout: float = 120.0,
     ) -> None:
         try:

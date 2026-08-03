@@ -517,6 +517,7 @@ class ReActAgent:
         max_output_tokens: int = 8_192,
         auto_index: bool = False,
         sandbox=None,
+        on_model_switch=None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
         if not self.workspace.is_dir():
@@ -526,6 +527,10 @@ class ReActAgent:
         # the tokens, so it is usually the one to run cheap.
         self._provider_was_supplied = provider is not None
         self._fallback_used = False
+        # Called as (agent_name, old_model, new_model, reason) when the model is
+        # swapped mid-run. The orchestrator uses it to comment on the issue, so
+        # a silent degradation becomes visible to whoever opened it.
+        self.on_model_switch = on_model_switch
         self.provider = provider or get_provider_for_role("coder")
         self.budget = budget or Budget()
         self.system = system or DEFAULT_SYSTEM
@@ -546,6 +551,20 @@ class ReActAgent:
         # tool results to 300 chars, which is too short to review against, so
         # the Reviewer reads this instead of the Coder's prose summary.
         self.last_test_output: str = ""
+
+    def _announce(self, old_model: str, new_model: str, err: Exception) -> None:
+        """Tell the caller a model swap happened, so it can surface it.
+
+        The agent deliberately knows nothing about GitHub — the orchestrator
+        passes a callback that posts an issue comment. A failure here must never
+        affect the run, so it is swallowed.
+        """
+        if self.on_model_switch is None:
+            return
+        try:
+            self.on_model_switch("Coder", old_model, new_model, str(err))
+        except Exception:
+            log.warning("could not announce model switch", exc_info=True)
 
     def _switch_to_fallback(self, err: Exception) -> bool:
         """Swap in the fallback model mid-run. True if the caller should retry.
@@ -568,10 +587,12 @@ class ReActAgent:
             return False
         if fallback is None:
             return False
+        old_model = getattr(self.provider, "model", "?")
+        new_model = getattr(fallback, "model", "?")
         log.warning("coder: %s — switching from %r to %r and continuing",
-                    err, getattr(self.provider, "model", "?"),
-                    getattr(fallback, "model", "?"))
+                    err, old_model, new_model)
         self.provider = fallback
+        self._announce(old_model, new_model, err)
         return True
 
     def _plan_deviation(self, path: str | None) -> str | None:
