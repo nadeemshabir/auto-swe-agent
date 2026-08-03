@@ -301,3 +301,63 @@ def test_no_fallback_when_it_would_be_the_same_model(monkeypatch):
     monkeypatch.setenv("LLM_PROVIDER", "gemini")
     monkeypatch.setenv("PLANNER_MODEL", FALLBACK_MODELS["gemini"])
     assert get_fallback_for_role("planner") is None
+
+
+# ── the Coder must survive a provider outage mid-run (§22 F25) ───────────────
+
+def test_coder_switches_model_instead_of_losing_the_run(tmp_path, monkeypatch):
+    """F25: a 503 at step 8 returned provider_error and threw away every step —
+    real money spent, nothing produced. It should swap models and continue."""
+    from agent.loop import ReActAgent
+    from agent.providers import ProviderError
+    import agent.loop as loop_mod
+
+    failing = _Prov("busy-model", [ProviderError("503 UNAVAILABLE")])
+    backup = _Prov("spare-model", ["all done"])
+    monkeypatch.setattr(loop_mod, "get_fallback_for_role", lambda role: backup)
+
+    agent = ReActAgent(workspace=tmp_path, provider=failing)
+    # Simulate the orchestrator's own provider resolution, so the fallback is
+    # allowed to fire (an explicitly supplied provider deliberately blocks it).
+    agent._provider_was_supplied = False
+
+    result = agent.run("fix the bug")
+
+    assert result.status == "completed", f"run was abandoned: {result.status}"
+    assert result.final_text == "all done"
+    assert agent.provider is backup, "did not switch to the fallback model"
+
+
+def test_coder_fallback_fires_only_once(tmp_path, monkeypatch):
+    """A permanently-down provider must terminate, not loop forever."""
+    from agent.loop import ReActAgent
+    from agent.providers import ProviderError
+    import agent.loop as loop_mod
+
+    failing = _Prov("busy-1", [ProviderError("503")])
+    also_failing = _Prov("busy-2", [ProviderError("503")])
+    monkeypatch.setattr(loop_mod, "get_fallback_for_role", lambda role: also_failing)
+
+    agent = ReActAgent(workspace=tmp_path, provider=failing)
+    agent._provider_was_supplied = False
+    result = agent.run("fix the bug")
+
+    assert result.status == "provider_error", "should give up after one fallback"
+
+
+def test_explicit_provider_blocks_the_coder_fallback(tmp_path, monkeypatch):
+    """provider= means 'use this one' — and keeps offline tests offline."""
+    from agent.loop import ReActAgent
+    from agent.providers import ProviderError
+    import agent.loop as loop_mod
+
+    called = []
+    monkeypatch.setattr(loop_mod, "get_fallback_for_role",
+                        lambda role: called.append(role))
+
+    agent = ReActAgent(workspace=tmp_path,
+                       provider=_Prov("x", [ProviderError("503")]))
+    result = agent.run("fix the bug")
+
+    assert result.status == "provider_error"
+    assert called == [], "fallback was resolved despite an explicit provider"

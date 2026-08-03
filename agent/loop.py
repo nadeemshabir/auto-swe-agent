@@ -48,12 +48,14 @@ except ImportError:
 
 try:
     from .providers import (
-        ProviderError, ToolCall, ToolSpec, Usage, get_provider, get_provider_for_role,
+        ProviderError, ToolCall, ToolSpec, Usage,
+        get_fallback_for_role, get_provider, get_provider_for_role,
     )
 except ImportError:  # executed as a loose script rather than a package module
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from agent.providers import (
-        ProviderError, ToolCall, ToolSpec, Usage, get_provider, get_provider_for_role,
+        ProviderError, ToolCall, ToolSpec, Usage,
+        get_fallback_for_role, get_provider, get_provider_for_role,
     )
 
 
@@ -522,6 +524,8 @@ class ReActAgent:
         # The Coder is a role like any other: CODER_PROVIDER / CODER_MODEL, then
         # LLM_*, then a non-empty default. This is the loop that spends most of
         # the tokens, so it is usually the one to run cheap.
+        self._provider_was_supplied = provider is not None
+        self._fallback_used = False
         self.provider = provider or get_provider_for_role("coder")
         self.budget = budget or Budget()
         self.system = system or DEFAULT_SYSTEM
@@ -542,6 +546,33 @@ class ReActAgent:
         # tool results to 300 chars, which is too short to review against, so
         # the Reviewer reads this instead of the Coder's prose summary.
         self.last_test_output: str = ""
+
+    def _switch_to_fallback(self, err: Exception) -> bool:
+        """Swap in the fallback model mid-run. True if the caller should retry.
+
+        Only ever fires once per run, and only when this agent resolved its own
+        provider — an explicitly supplied provider means the caller wants that
+        one, and silently switching would surprise them (and would make offline
+        tests reach the network).
+
+        The fallback stays on the same *provider*, so the accumulated `messages`
+        list — whose entries are in that vendor's native format — remains valid.
+        Crossing vendors mid-conversation would corrupt the history.
+        """
+        if self._fallback_used or self._provider_was_supplied:
+            return False
+        self._fallback_used = True
+        try:
+            fallback = get_fallback_for_role("coder")
+        except Exception:
+            return False
+        if fallback is None:
+            return False
+        log.warning("coder: %s — switching from %r to %r and continuing",
+                    err, getattr(self.provider, "model", "?"),
+                    getattr(fallback, "model", "?"))
+        self.provider = fallback
+        return True
 
     def _plan_deviation(self, path: str | None) -> str | None:
         """Return a description if `path` is outside the plan's files_to_touch.
@@ -643,6 +674,13 @@ class ReActAgent:
                     max_tokens=self.max_output_tokens,
                 )
             except ProviderError as e:
+                # Don't discard the run over a provider outage. The message
+                # history and the edits already on disk are real work — a run
+                # that dies at step 8 has spent real money and produced nothing
+                # (plan2.md §22 F25). Swap to a fallback model once and carry
+                # on with the same conversation.
+                if self._switch_to_fallback(e):
+                    continue
                 log.error("provider error: %s", e)
                 return RunResult("provider_error", str(e), steps, self.budget)
             except Exception as e:  # unexpected SDK / parsing failure

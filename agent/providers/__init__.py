@@ -88,7 +88,12 @@ DEFAULT_MODELS: dict[str, str] = {
 # just failed — otherwise it would just repeat the same call.
 FALLBACK_MODELS: dict[str, str] = {
     "anthropic": "claude-opus-4-8",
-    "gemini": "gemini-3.5-flash",
+    # An OLDER generation on purpose. The point of a fallback is spare capacity,
+    # not quality: current-generation models are the contended ones, and
+    # `gemini-3.5-flash` — the obvious choice, and a common Coder setting — was
+    # itself returning 503 during the outage this was written for. Falling back
+    # to the model that is already failing is not a fallback.
+    "gemini": "gemini-2.5-flash",
 }
 
 ROLES = ("planner", "coder", "reviewer")
