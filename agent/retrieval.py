@@ -36,15 +36,17 @@ log = logging.getLogger("agent.retrieval")
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Paths: env-overridable (CHROMA_DIR / EMBEDDING_CACHE_DIR) so a deployment
-# can point them at a persistent volume (plan §7.3/§7.4); the default is
-# anchored to this file, not the CWD, so dev runs are stable no matter where
-# the process is launched from. Directories are created lazily on first use —
-# importing this module must have no filesystem side effects.
+# Paths: the embedding cache is env-overridable (EMBEDDING_CACHE_DIR) so a
+# deployment can point it at a persistent volume; the default is anchored to
+# this file, not the CWD, so dev runs are stable no matter where the process is
+# launched from. The directory is created lazily on first use — importing this
+# module must have no filesystem side effects.
+#
+# There is deliberately no CHROMA_DIR: the vector store is in-memory only.
+# See get_collection() for why.
 # ───────────────────────────────────────────────────────────────────────────
 
 BASE_DIR   = Path(__file__).resolve().parent
-CHROMA_DIR = Path(os.getenv('CHROMA_DIR', str(BASE_DIR / '.chroma')))
 CACHE_DIR  = Path(os.getenv('EMBEDDING_CACHE_DIR', str(BASE_DIR / '.embedding_cache')))
 
 
@@ -71,17 +73,40 @@ def get_embedder():
             ) from e
     return _EMB_MODEL
 
-# ChromaDB — persistent local store, opened lazily on first use. Opening a
-# PersistentClient at import time created the .chroma dir as a side effect of
-# merely importing this module and made every importer pay the startup cost.
+# ChromaDB — IN-MEMORY only, opened lazily on first use.
+#
+# Why ephemeral rather than persisted to disk (plan2.md §16 D19, §22 F9):
+#
+#   • Nothing useful ever survived a run anyway. Each run clones into a fresh
+#     workspace (${WORKSPACE_ROOT}/${run_id}/repo), indexes it under that
+#     unique path, and drops it again at cleanup — so an on-disk store held
+#     only data that was about to be deleted.
+#   • Persistence was therefore a pure liability: if a worker died before
+#     cleanup ran, its vectors were orphaned on disk forever. In memory that
+#     failure mode cannot exist — a dead process takes its index with it.
+#   • Two Celery workers in one container sharing an on-disk store is
+#     file-contention risk for no benefit.
+#   • It removes a deployment concern before it exists: no persistent volume
+#     to provision for the vector store in Azure (§21 Phase 2).
+#
+# What still makes re-indexing cheap is the EMBEDDING CACHE (CACHE_DIR), which
+# is keyed by content hash and IS persisted — unchanged files skip the model
+# entirely on every subsequent run. That is where the real saving lives.
+#
+# Consequence: an index only exists for the life of the process that built it.
+# The orchestrator always indexes after cloning, so the pipeline is unaffected;
+# manual CLI use must pass --auto-index.
+#
+# Opening the client lazily (not at import) keeps importing this module free of
+# side effects and startup cost — see §17 M2.
 _CHROMA_CLIENT = None
 _COLLECTION = None
 
 def get_collection():
-    """Open (once) and return the chunk collection."""
+    """Open (once) and return the in-memory chunk collection."""
     global _CHROMA_CLIENT, _COLLECTION
     if _COLLECTION is None:
-        _CHROMA_CLIENT = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        _CHROMA_CLIENT = chromadb.EphemeralClient()
         _COLLECTION = _CHROMA_CLIENT.get_or_create_collection('code')
     return _COLLECTION
 
@@ -329,17 +354,14 @@ def embed_chunk(code: str) -> list[float]:
 def drop_repo(root: str) -> bool:
     """Delete every chunk indexed under `root` from the vector store.
 
-    Each run indexes from a fresh ephemeral workspace
-    (${WORKSPACE_ROOT}/${run_id}/repo), so without this the collection keeps a
-    complete copy of the repository for every run ever executed — the workspace
-    is deleted but its vectors are not (plan2.md §22 F9).
+    Still needed even though the store is in-memory (see get_collection): a
+    Celery worker process is long-lived and handles many runs, so without this
+    the collection would grow with every issue until the process recycled
+    (plan2.md §22 F9). Ephemeral storage bounds the leak to one process's
+    lifetime; this bounds it to one run.
 
     Called from the orchestrator's cleanup. Best-effort: a failure here must
     never fail a run that has already produced a PR. Returns True on success.
-
-    NOTE: this makes the index per-run and therefore re-embeds the whole repo on
-    every issue. Keying the index on the repo slug so it persists and is truly
-    incremental is the better long-term answer — see DECISION D19.
     """
     try:
         get_collection().delete(where={'repo': os.path.abspath(root)})

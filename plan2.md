@@ -1,6 +1,6 @@
 # Autonomous SWE Agent — Master Plan & Source of Truth
 
-> **Status:** ACTIVE — this is the single source of truth · **Version:** 3.3 · **Date:** 2026-07-30 · **Owner:** Nadeem
+> **Status:** ACTIVE — this is the single source of truth · **Version:** 3.9 · **Date:** 2026-07-31 · **Owner:** Nadeem
 >
 > **This document supersedes `plan.md` (v0.1) and absorbs `newplan.md` (multi-agent
 > design + build order).** v2.0 described a single-loop agent where the backend was
@@ -36,8 +36,14 @@
 | 2.1 | 2026-07-27 | Appended §21 cloud deployment roadmap (Phases 0–5). |
 | **3.0** | **2026-07-30** | **Full re-baseline.** Backend/API/persistence/Compose marked built. Multi-agent architecture (Planner/Coder/Reviewer) documented as first-class (§6.8–6.10, §4 rewritten). Absorbed `newplan.md`. **Added deep-scan audit 2 (§22) — 16 findings, all OPEN.** Added remediation work order (§23) and testing strategy (§24). Model/pricing table now delegates to code (§6.6) instead of duplicating figures that went stale. New decisions D14–D20. |
 | **3.1** | **2026-07-30** | **M6 landed — all 4 Critical findings closed (F1, F2, F3, F4) plus F11.** Pipeline reordered so the Planner runs after clone+index with retrieval enabled; Reviewer now gets a staged diff and real test output; one Budget threaded through all three agents; a good fix survives a failed review round. Fixed a latent `None` subscript crash on the `max_tokens` result path. **First real integration tests added** (`tests/test_orchestrator_critical.py`, 5 tests) — §24 Layer 2 opened. 11 findings remain open (5 High, 6 Medium). |
-| **3.3** | **2026-07-30** | **M9, M11 and most of M10 landed — F8, F12, F13, F14, F15, F16 closed; F9 half-closed.** `POST /runs` now requires a shared secret (fail-closed), honours a repo allowlist, and is rate limited. Guardrail paths normalised and deviations surfaced in the trace and PR. Reviewer failures are now visibly `review_status='unavailable'` instead of silently "approved". Red/Green extraction rewritten. Coder re-runs receive their own prior diff. Vector index dropped on cleanup. `requirements.txt` fully pinned. **29 tests.** **Only D19 (persistent index) and the decision-gated items remain — see §25.** |
 | **3.2** | **2026-07-30** | **M7 landed — F5, F6, F7, F10 closed.** One run id now spans API, Celery, and the `runs` row, so the read API is reachable. Tool calls actually persist. `runs` is **append-only** with a partial unique index on active runs (migration `c4d1e88a5f27`), replacing the PK-mutating re-run path; the index also settles the concurrency race at the database, so **no Redis lock is needed** (D16/D17 resolved). Stale-run reaper added. Test harness extracted to `tests/conftest.py`; `tests/test_orchestrator_trace.py` added — **12 tests total**. **7 findings remain: 2 High (F8, F9), 5 Medium (F12–F16).** |
+| **3.3** | **2026-07-30** | **M9, M11 and most of M10 landed — F8, F12, F13, F14, F15, F16 closed; F9 half-closed.** `POST /runs` now requires a shared secret (fail-closed), honours a repo allowlist, and is rate limited. Guardrail paths normalised and deviations surfaced in the trace and PR. Reviewer failures are now visibly `review_status='unavailable'` instead of silently "approved". Red/Green extraction rewritten. Coder re-runs receive their own prior diff. Vector index dropped on cleanup. `requirements.txt` fully pinned. **29 tests.** **Only D19 (persistent index) and the decision-gated items remain — see §25.** |
+| **3.4** | **2026-07-31** | **F9 fully closed; `[D19]` decided: the vector store is in-memory.** `PersistentClient` → `EphemeralClient`, `CHROMA_DIR` removed, the stale on-disk `.chroma` store deleted. Persisting it bought no reuse (every run indexes a unique workspace path) while costing orphaned vectors on worker death, file contention between workers, and a volume to provision in Phase 2. `drop_repo()` retained — a long-lived Celery worker would otherwise accumulate across runs. The content-hash **embedding cache stays persisted**; that is where the real re-indexing saving lives. **All 16 findings now closed.** |
+| **3.5** | **2026-07-31** | **Per-role provider/model config for all three agents, and a new finding (F17) fixed.** All resolution centralised in `agent/providers/resolve_role()`: role vars → `LLM_*` → a hardcoded default that **can never be empty**. Added `CODER_PROVIDER`/`CODER_MODEL` (the Coder had no override at all); removed the Reviewer's surprising chain through `PLANNER_*`. **F17:** a model id could leak across providers — `PLANNER_PROVIDER=anthropic` with a Gemini `LLM_MODEL` sent a Gemini model name to the Anthropic API. Also fixed the `app.main` self-test, which depended on ambient `AGENT_REPO_ALLOWLIST`. **50 tests.** |
+| **3.6** | **2026-07-31** | **M13 — webhook setup script.** `scripts/setup_webhook.sh` registers/updates the GitHub webhook via the API (`--list` / `--ping` / `--delete` too), removing the manual per-repo setup step. Idempotent by webhook *path*, so an ngrok restart updates the existing hook instead of leaving a dead one behind. Subscribes to `issues` only. Verified against the live API. |
+| **3.7** | **2026-07-31** | **D20 decided — the last open decision.** Planner and Reviewer on `gemini-3.1-pro-preview`, Coder on `gemini-3.5-flash`; ids taken from the account's live catalogue rather than any document. **F18 found and fixed:** a model missing from `PRICING` was silently costed at the pro rate — the configured `gemini-3.5-flash-lite` was priced at ~22x its real rate, inflating every PR footer and tripping `MAX_USD` far too early. Pricing table filled out and the fallback now warns. |
+| **3.8** | **2026-07-31** | **`[D10]` decided — deploy target changed from Azure Container Apps to a single VM running the existing compose stack.** Container Apps offers no host Docker daemon, so it would have forced the sandbox to be replaced or abandoned; a VM keeps `agent/sandbox.py` running **unchanged**, preserving the §9 threat model and the H1 fix. Residual risk (socket mount = root on host) is recorded in §10 with the conditions that make it acceptable. §21 Phase 2 rewritten; TLS via a reverse proxy is now the one new piece of work. **No decisions remain open.** |
+| **3.9** | **2026-07-31** | **`[D10]` revised — container platform with the sandbox off, behind a flag.** The webhook path was already running `use_sandbox=False`, so the VM was preserving a capability that was not switched on. New `USE_SANDBOX` env var gates it end to end (`POST /runs` can still override per request), so enabling it later is a config change and **not a code change** — the actual requirement. Accepted trade while off: repo tests run in the worker container alongside the tokens, which is why `AGENT_REPO_ALLOWLIST` must stay set. VM analysis retained in §10 for when the sandbox is needed. |
 
 ---
 
@@ -131,7 +137,7 @@ the loop, under hard caps on time, tokens, and money, with every step persisted.
 | (2) Queue & workers | **built** | `workers/tasks.py` — full orchestrator; `workers/__init__.py` — Celery app |
 | (3) Codebase understanding | **built** *(index lifecycle defective — F9)* | `agent/retrieval.py` |
 | (4) Reasoning core | **built** ✅ | `agent/planner.py`, `agent/loop.py`, `agent/reviewer.py`, `agent/schemas.py`. Handoffs repaired in v3.1 (F1–F4, F11); quality items F12–F15 remain |
-| (5) Sandbox | **built** | `agent/sandbox.py` — cloud story still open (D10) |
+| (5) Sandbox | **built, off in deployment** | `agent/sandbox.py` is complete; `USE_SANDBOX=false` on the container platform. A config flip, not a code change (§10 D10) |
 | (6) State & observability | **built** ✅ | `db/` + 4 Alembic migrations + read API. Run identity unified and traces populated in v3.2 (F5, F6, F7, F10) |
 
 > **The headline:** every box on this diagram exists. v2.0's problem was missing
@@ -326,7 +332,7 @@ ChromaDB, queueing → Redis.*
   passes `run_id` and the identical Celery `task_id`; `_resolve_run_id()` falls back to
   the task id, then a fresh UUID, so `run_issue.delay(repo, n)` still works (F5).
 
-### 6.4 Codebase understanding / retrieval (`agent/retrieval.py`) — **built** *(D19 open)*
+### 6.4 Codebase understanding / retrieval (`agent/retrieval.py`) — **built** ✅
 - **Pipeline:** tree-sitter chunking (functions/methods/classes; decorated defs
   unwrapped; methods indexed individually + a class-header chunk to dodge embedding
   truncation; imports) → batched sentence-transformers embeddings → ChromaDB upsert
@@ -336,11 +342,11 @@ ChromaDB, queueing → Redis.*
 - **Isolation:** results *are* correctly scoped — `retrieve()` filters on a `repo`
   metadata field set to `os.path.abspath(root)`. Cross-repo leakage into results does
   **not** occur.
-- 🟡 **F9 half fixed (v3.3):** `drop_repo(root)` deletes a run's chunks and the
-  orchestrator calls it during cleanup, so the collection no longer grows without bound.
-  **Still open:** the index is keyed on the ephemeral workspace path, so the full repo is
-  re-embedded on **every single issue**. Making it persistent and incremental means
-  keying on the repo slug — `[DECISION D19]`, §25.2.
+- ✅ **F9 fixed (v3.3 + v3.4):** the vector store is now **in-memory**
+  (`EphemeralClient`, no `CHROMA_DIR`), and `drop_repo(root)` clears a run's chunks at
+  cleanup so a long-lived worker process does not accumulate them. See §7.3 for why
+  ephemeral is the right shape here, not a compromise. The repo is re-indexed per run;
+  the persisted **embedding cache** is what keeps that cheap.
 - **Token counting:** provider-neutral local estimate (~3.5 chars/token) for packing;
   exact counts come from the active provider. Never `tiktoken` (wrong for both vendors).
 - **Self-test:** `python -m agent.retrieval` (needs ML deps; run in the Linux/WSL venv).
@@ -377,11 +383,45 @@ ChromaDB, queueing → Redis.*
   objects: `ToolSpec`, `ToolCall`, `Usage`, `LLMResponse`, `ProviderError`. **Agents
   import only these — never a vendor SDK.**
 - **Adapters:** `anthropic_provider.py`, `gemini_provider.py`.
-- **Selection:** `get_provider(name=..., model=...)` driven by `LLM_PROVIDER` /
-  `LLM_MODEL`, with per-role overrides resolved by each agent (§6.8, §6.9).
-- **Embeddings:** `all-MiniLM-L6-v2` via sentence-transformers, **local, in-process,
-  no API cost, no network**. Its ~256-token chunk limit drives §6.4's chunking.
-  `[ASSUMPTION A1 / DECISION D12]`
+- **Selection — one resolver for all three roles.** `resolve_role(role)` returns a
+  validated `(provider, model)` for `planner` | `coder` | `reviewer`:
+  1. `<ROLE>_PROVIDER` / `<ROLE>_MODEL`, if set
+  2. `LLM_PROVIDER` / `LLM_MODEL`, if set
+  3. `DEFAULT_PROVIDER` / `DEFAULT_MODELS[provider]` — **hardcoded and never empty**
+
+  Rule 3 is the guarantee: however half-filled `.env` is, resolution terminates at a real
+  provider and a real model. **A global model is inherited only when the resolved
+  provider matches the global provider** — a model id is provider-specific, and
+  inheriting one across providers was a live bug (§22 F17). Unknown provider names raise
+  rather than silently defaulting. `get_provider()` applies the same rule for direct
+  callers (the CLI, self-tests).
+- **`DEFAULT_MODELS` is the single source of truth** for "what model when nobody said" —
+  edit it there, not in the adapters.
+
+**Models in use (D20, decided 2026-07-31):**
+
+| Role | Model | Why |
+|---|---|---|
+| Planner | `gemini-3.1-pro-preview` | one call per run; plan quality sets everything downstream |
+| Reviewer | `gemini-3.1-pro-preview` | one call per run; catching what the Coder missed is the whole point of the third agent |
+| Coder | `gemini-3.5-flash` | runs the ReAct loop and dominates token spend |
+
+The Coder sits one tier above `-lite` deliberately. The loop does multi-step tool calling
+with exact-string edits, which is demanding; starting at the weakest tier risks reading
+"flash-lite cannot drive this tool loop" as "the architecture does not work". Drop to
+`-lite` as a cost optimisation *after* Phase 0 establishes a baseline.
+
+> Ids came from the account's live catalogue (`client.models.list()`), not from any
+> document — that is the check to repeat whenever these are revisited. Note
+> `gemini-3.1-pro-preview` is a **preview** model (every 3.x pro variant is): fine for
+> Phase 0, but re-check before Phase 2. `gemini-2.5-pro` is the stable fallback.
+
+**Cost tracking:** each adapter's `PRICING` dict feeds the `MAX_USD` cap only. A model
+missing from it is costed at the pro rate and now **logs a warning**, because a silent
+mispricing is what made `gemini-3.5-flash-lite` cost out at 22× its real rate (§22 F18).
+- **Embeddings (`[ASSUMPTION A1 / DECISION D12]`):** We use `all-MiniLM-L6-v2` via `sentence-transformers`.
+  - **Why?** It is a small, fast, completely open-source model that runs locally on the CPU. Using a larger local model would slow down the Celery worker, and using a paid API model (like OpenAI `text-embedding-3`) would burn money every time a repo is indexed. MiniLM guarantees **no API cost and no network calls**.
+  - **Constraints:** Its ~256-token chunk limit strictly drives the Python chunking strategy in §6.4.
 
 > **Model IDs and pricing are deliberately NOT duplicated here.** v2.0 pinned a table
 > of model names and per-Mtok prices into this document; it drifted out of sync with
@@ -419,9 +459,13 @@ ChromaDB, queueing → Redis.*
 - **No new dependency:** shells out to the `docker` CLI.
 - **Image:** `docker/sandbox.Dockerfile` (python:3.12-slim-bookworm + pytest pre-baked,
   since the container has no network — `[DECISION D9]`). Pin by digest in prod.
-- 🔶 **Open:** `[DECISION D10]` — how workers get Docker **in the cloud**. Azure
-  Container Apps does not offer the host socket. This blocks sandboxed execution on
-  Phase 2 and must be decided before it (§21 Phase 1).
+- ✅ **`[DECISION D10]` decided (§10):** deployed with `USE_SANDBOX=false` on a
+  container platform; the flag turns it on unchanged on any Docker-daemon host. Runs
+  fail loudly (`sandbox_error`) if the flag is set without a daemon, so the
+  misconfiguration cannot pass silently.
+- 🔶 **`[DECISION D9]` still open and a prerequisite for turning it on:** no network
+  inside, and a bare `python -m pytest` against the *image's* site-packages, so the
+  image must carry the target repo's test dependencies.
 - **Self-test:** `python -m agent.sandbox` (degrades gracefully with no daemon).
 
 ### 6.8 Planner agent (`agent/planner.py`) — **built** ✅ 🆕
@@ -471,11 +515,10 @@ ChromaDB, queueing → Redis.*
   scan. `from_dict` coerces types and clamps enums (an invalid verdict becomes
   `approve`, an invalid confidence becomes `medium`).
 - **Self-test:** `python -m agent.schemas`. Passing, with good edge-case coverage.
-- 🔶 `[DECISION D15]` — this whole parsing layer exists because we ask for JSON in a
-  prompt. Both providers support native structured output (Anthropic forced tool use;
-  Gemini `response_schema`). Adding `complete_structured(schema=...)` to `LLMProvider`
-  would make malformed output *impossible* rather than merely recoverable, and delete
-  most of `_extract_json` plus the retry-nudge path in §6.8.
+- 🔶 `[DECISION D15]` — **Move to Native Structured Output.**
+  - **The Problem:** Currently, the system asks the AI via a text prompt to "output JSON" and uses a brittle regex scanning layer (`_extract_json`) to extract and parse that JSON from free-form text. If the LLM makes a typo, we rely on defensive Python defaults to prevent crashes.
+  - **The Solution:** Providers like Anthropic, Gemini, and OpenAI now support native structured output (passing a Python schema directly into the API request).
+  - **Action:** We must migrate the adapters to use native schemas. This mathematically forces the API to return 100% perfectly formatted JSON that matches our expected contract, making malformed handoffs impossible and allowing us to delete the brittle `_extract_json` parsing logic entirely.
 
 ## 7. Data & storage architecture
 
@@ -518,18 +561,28 @@ ChromaDB, queueing → Redis.*
 - **Not built:** default-branch cache, GitHub rate-limit state, webhook rate limiting
   (M9).
 
-### 7.3 Vector store — ChromaDB — **built** *(D19 open)*
+### 7.3 Vector store — ChromaDB, **in-memory** — **built** ✅ *(D19 decided)*
 - Chunk embeddings + metadata (file path, symbol, start/end lines, repo). Written by
-  §6.4, read by `retrieve_context`. Location env-overridable (`CHROMA_DIR`), opened
-  lazily (§17 M2). Chunk IDs and the delete-by-file filter keyed on **absolute** paths
-  (§17 L1).
-- 🟡 **F9 / `[DECISION D19]`** — the intended design is "one collection per repo,
-  persisted, incremental across runs". v3.3 shipped option **(b)**: keep the index
-  per-run and delete `where={'repo': ...}` during cleanup via `retrieval.drop_repo()`.
-  That closes the unbounded growth. Option **(a)** — key the index on the **repo slug**
-  so it persists and is genuinely incremental, removing the full re-embed on every issue
-  — is still open. It is the better steady state but needs staleness handling and a
-  persistent volume in Phase 2, so it is the owner's call (§25.2).
+  §6.4, read by `retrieve_context`. Opened lazily (§17 M2). Chunk IDs and the
+  delete-by-file filter keyed on **absolute** paths (§17 L1).
+- ✅ **F9 closed / `[DECISION D19]` decided: ephemeral.** v3.4 switched
+  `PersistentClient` → `EphemeralClient` and removed `CHROMA_DIR` entirely. The original
+  plan's "one collection per repo, persisted, incremental across runs" was never what
+  the code did and, on inspection, is not what this design wants: each run clones into a
+  unique workspace and indexes under that path, so an on-disk store only ever held data
+  that was about to be deleted. Persisting it bought no reuse and cost one real failure
+  mode — a worker dying before cleanup orphaned its vectors on disk permanently — plus
+  file contention between concurrent workers and a persistent volume to provision in
+  Phase 2. In memory, a dead process takes its index with it.
+- **`drop_repo()` is still called at cleanup.** A Celery worker is long-lived across
+  many runs, so ephemeral storage alone bounds growth to a process lifetime; the drop
+  bounds it to a single run.
+- **The persistent piece that matters is the embedding cache** (`EMBEDDING_CACHE_DIR`,
+  keyed by content hash): unchanged files skip the model on every subsequent run. That
+  is where the re-indexing saving actually lives, and it is unaffected by this change.
+- **Trade-off accepted:** the repo is re-indexed per run. If Phase 0 shows that to be
+  slow in practice, the answer is a warm cache or a slug-keyed persistent index — but
+  measure first.
 - `[DECISION D8]` ChromaDB vs pgvector/Qdrant if we outgrow it. Default ChromaDB.
 
 ### 7.4 Object store + workspace filesystem — **partial**
@@ -554,8 +607,9 @@ ChromaDB, queueing → Redis.*
 | `LLM_PROVIDER` | `anthropic` \| `gemini` | `gemini` *(per `.env`)* | built |
 | `LLM_MODEL` | model id | see `.env` | built |
 | `LLM_EFFORT` | `low\|medium\|high\|xhigh\|max` | `high` | built |
-| `PLANNER_PROVIDER` / `PLANNER_MODEL` | per-role override for §6.8 | falls back to `LLM_*` | built |
-| `REVIEWER_PROVIDER` / `REVIEWER_MODEL` | per-role override for §6.9 | falls back to `PLANNER_*` → `LLM_*` | built |
+| `PLANNER_PROVIDER` / `PLANNER_MODEL` | per-role override for §6.8 | → `LLM_*` → hardcoded default | built |
+| `CODER_PROVIDER` / `CODER_MODEL` | per-role override for §6.5 | → `LLM_*` → hardcoded default | built |
+| `REVIEWER_PROVIDER` / `REVIEWER_MODEL` | per-role override for §6.9 | → `LLM_*` → hardcoded default | built |
 | `PLANNER_RETRIEVAL_K` / `PLANNER_TOKEN_BUDGET` | Planner context size | 10 / 6000 | built *(unused until F1)* |
 | `MAX_REVIEW_ROUNDS` | Reviewer↔Coder feedback rounds | 2 | built |
 | `COMMENT_ON_START` | post the pre-work issue comment | `true` | built |
@@ -568,7 +622,7 @@ ChromaDB, queueing → Redis.*
 | `DATABASE_URL` | Postgres DSN | — | built |
 | `REDIS_URL` | broker/cache | `redis://localhost:6379/0` | built |
 | `WORKSPACE_ROOT` | scratch dir for clones | `/var/agent/workspaces` | built |
-| `CHROMA_DIR` / `EMBEDDING_CACHE_DIR` | vector store + embed cache | under `agent/` | built |
+| `EMBEDDING_CACHE_DIR` | embedding cache (content-hash keyed). *There is no `CHROMA_DIR` — the vector store is in-memory (§7.3).* | under `agent/` | built |
 | `MAX_STEPS` / `MAX_TOTAL_TOKENS` / `MAX_USD` / `MAX_WALLCLOCK_S` | budgets | 30 / 500k / 5.0 / 1800 | built |
 | `SANDBOX_IMAGE`, `SANDBOX_CPUS`, `SANDBOX_MEMORY`, `SANDBOX_PIDS_LIMIT`, `SANDBOX_TIMEOUT_S`, `SANDBOX_TMPFS_SIZE`, `SANDBOX_USER`, `DOCKER_BIN` | sandbox limits | pinned / 1 / 2g / 256 / 300 / 64m / auto / `docker` | built |
 | **`AGENT_API_TOKEN`** | shared secret for `POST /runs`; **unset = endpoint disabled (503)** | — | ✅ built |
@@ -641,13 +695,80 @@ Each test run dispatches `docker exec [timeout --signal=KILL Ns] sh -lc "<cmd>"`
 container is `docker rm -f`'d at the end. Stdout/stderr captured and truncated to the
 tool-result cap; exit code returned.
 
-`[DECISION D10 — OPEN, now blocking]` How workers get Docker: host socket (simplest,
-weakest boundary — what Compose does today via a mounted socket) vs rootless/remote
-daemon vs Kubernetes-native per-run Jobs. **Azure Container Apps offers none of these**,
-so this decision gates §21 Phase 2. Options: rootless DinD in the worker container;
-replace Docker with a subprocess sandbox (`nsjail`/`bubblewrap`); or run unsandboxed on
-cloud **against trusted repos only** and restore the sandbox at AKS (Phase 4). Whichever
-you pick, record it here and update `agent/sandbox.py`.
+### `[DECISION D10 — DECIDED 2026-07-31, revised]` The sandbox in the cloud
+
+**Chosen: deploy to an Azure container platform with the sandbox OFF, behind a config
+flag — and move to a Docker-daemon host only when the sandbox is actually needed.**
+
+The reasoning that got here matters, because the first version of this decision reached
+for a VM and that was over-built for the present state.
+
+**The observation that changed it:** the webhook path was *already* running with the
+sandbox off — `_enqueue_run(run_issue, repo, number)` took the `use_sandbox=False`
+default, so every real run to date has executed tests host-side in the worker container.
+The VM was being provisioned to preserve a capability that was not switched on. For
+first-party repositories behind `AGENT_REPO_ALLOWLIST`, that is a defensible trade, and
+a container platform is simpler, cheaper to idle, and has less to operate.
+
+**How it stays a config flip, not a rewrite** (the actual requirement): `USE_SANDBOX`
+now gates it end to end. `false` on the container platform; `true` on any host with a
+Docker daemon. `POST /runs` may still override per request, which is how you smoke-test
+the sandbox without changing deployment config. **No code changes when the time comes.**
+
+**What you accept while it is off.** A repository's test suite executes inside the
+worker container, which holds `GITHUB_TOKEN`, the LLM API key, and the database
+credentials in its environment. A malicious or compromised test can read all of them.
+That is fine for code you wrote; it is **not** fine the first time this points at a
+repository you did not. The allowlist is what keeps that boundary honest, so it must
+stay set.
+
+**When to move, and to what.** The moment a non-first-party repository is in scope, flip
+`USE_SANDBOX=true` — which requires relocating to a host with a Docker daemon, since
+Container Apps and ACI provide none. That is the VM (host socket, conditions in the
+"residual risk" note below) or AKS with per-run Jobs. Setting the flag without a daemon
+does **not** silently degrade: the run ends `sandbox_error`.
+
+**The other prerequisite, easy to miss:** the sandbox has no network and runs a bare
+`python -m pytest` against the *image's* site-packages. So the sandbox image must carry
+the target repo's test dependencies — `[DECISION D9]`, still open and a bigger job than
+the flag.
+
+---
+
+**If/when the VM path is taken, the original analysis stands:**
+
+**Chosen there: the host socket, on a dedicated, disposable VM.** The worker mounts
+`/var/run/docker.sock`, exactly as `docker-compose.yml` already does locally. No change
+to `agent/sandbox.py`.
+
+**Why.** The alternatives — rootless DinD, a daemon-free subprocess sandbox
+(`nsjail` / `bubblewrap`), Kubernetes-native per-run Jobs, or running unsandboxed — are
+all workarounds for a constraint that exists only on PaaS: no host Docker daemon. A VM
+has one, so the question largely dissolves. Crucially this is the only option under
+which **the sandbox survives intact**: network isolation, read-only host FS, the `.git`
+tmpfs mask, dropped capabilities, resource caps. The unsandboxed option would have meant
+executing untrusted repository code with no isolation at all, discarding the §9 threat
+model and the H1 fix that audit 1 was built around. No amount of managed-platform
+convenience is worth that.
+
+**The residual risk, stated plainly.** Mounting the Docker socket into the worker means
+**a container escape is root on the host**. That is what D10 was originally about, and
+choosing a VM does not remove it — it makes the blast radius acceptable, *conditionally*.
+The conditions are load-bearing:
+
+- The VM runs **nothing else you care about**. It is disposable: worst case you destroy
+  and rebuild it.
+- `GITHUB_TOKEN` on that host is scoped to the repositories in `AGENT_REPO_ALLOWLIST`
+  and nothing more.
+- Inbound is firewalled to 22 and 443. **Port 8000 is never published**; TLS terminates
+  at a reverse proxy in front of `api` (§21 Phase 2).
+
+If any of those stops being true — the box picks up another service, or the token is
+broadened — revisit this. The qualifier is doing the security work, not the choice.
+
+**Upgrade path.** Rootless Docker on the same VM is a strictly better boundary and a
+drop-in improvement whenever you want it. gVisor/Kata (D7) or per-run Kubernetes Jobs
+remain the answer for genuinely hostile repositories.
 
 ## 11. Observability — **built** ✅
 
@@ -705,8 +826,9 @@ directory holding the slot.
   `redis`, `migrate` (runs Alembic once and exits; `api`/`worker` wait on it), `api`,
   `worker` (`--concurrency=2`, Docker socket mounted for the sandbox). Scale with
   `docker-compose up --scale worker=3`.
-- **Cloud — not started.** See §21. Azure Container Apps is the target (Phase 2); AKS
-  is a later, optional learning migration (Phase 4).
+- **Cloud — not started.** See §21. A single **VM running this same compose stack** is
+  the target (Phase 2), so the local and cloud topologies are identical; AKS is a
+  later, optional learning migration (Phase 4).
 - **CI/CD — not started.** No workflow beyond an empty `.github/`. §21 Phase 5.
 
 ## 15. Repository / code layout (actual, 2026-07-30)
@@ -729,7 +851,9 @@ auto-swe-agent/
 │   └── migrations/versions/     # 3 Alembic revisions (1 untracked — commit it)
 ├── docker/                      # api / worker / sandbox Dockerfiles               built
 ├── docker-compose.yml           # 5-service local stack                    [§14]   built
-├── scripts/setup_postgres.sh    # (setup_webhook.sh — not started, §18 M13)
+├── scripts/
+│   ├── setup_postgres.sh        # one-time local Postgres bootstrap
+│   └── setup_webhook.sh         # register/update the GitHub webhook  [§18 M13]  built
 ├── tests/                       # integration suite — 29 tests             [§24]   built
 │   ├── conftest.py                   # shared harness: real run_issue + fakes
 │   ├── test_orchestrator_critical.py # §22 F1-F4, F11       (M6)
@@ -760,7 +884,7 @@ we are not building one.
 | D7 | Sandbox runtime hardening | Docker / gVisor / Kata | Docker + hardening |
 | D8 | Vector store | ChromaDB / pgvector / Qdrant | ChromaDB |
 | D9 | Deps in a no-network sandbox | pre-bake / mirror / audited install | pre-bake + mirror |
-| **D10** | **How workers get Docker in cloud** | host socket / rootless DinD / nsjail / K8s Jobs / unsandboxed-trusted-only | 🔴 **OPEN — blocks §21 Phase 2** |
+| **D10** | The sandbox in the cloud | VM w/ host socket / container platform, sandbox off / AKS Jobs | ✅ **container platform, `USE_SANDBOX=false`; VM or AKS when the sandbox is needed — DECIDED v3.9 (§10)** |
 | D11 | Artifact/log retention | 7 / 30 / 90 days | 30 days |
 | D12 | Embedding model | MiniLM / larger local | MiniLM first |
 | D13 | Concurrency cap | replicas / global semaphore | HPA + global cap |
@@ -769,8 +893,8 @@ we are not building one.
 | **D16** 🆕 | `runs` table shape | unique `(repo,issue)` upsert / append-only + partial index | ✅ **append-only — DONE v3.2** |
 | **D17** 🆕 | Who mints `run_id` | API (pass as Celery `task_id`) / task | ✅ **API — DONE v3.2** |
 | **D18** 🆕 | Reviewer failure semantics | fail-open silently / fail-open **but visibly** / fail-closed | ✅ **fail-open visibly — DONE v3.3** |
-| **D19** 🆕 | Chroma index lifecycle | per-repo persistent (slug-keyed) / per-run ephemeral+cleanup | 🔶 **ephemeral+cleanup shipped; persistent still OPEN — §25.2** |
-| **D20** 🆕 | Model defaults per role | all cheap / cheap Coder + strong Planner/Reviewer | 🔶 **OPEN — §25.2** |
+| **D19** 🆕 | Vector index lifecycle | per-repo persistent (slug-keyed) / **in-memory, per-run** | ✅ **in-memory — DECIDED v3.4** |
+| **D20** 🆕 | Model defaults per role | all cheap / cheap Coder + strong Planner/Reviewer | ✅ **cheap Coder + strong Planner/Reviewer — DECIDED v3.7** |
 
 ## 17. Deep-scan audit 1 — 2026-07-02 — **ALL CLOSED** *(historical)*
 
@@ -805,7 +929,7 @@ show `max_tokens` truncation); `provider.count_tokens` kept but unused by `Budge
 1. **M1 — Orchestrator (`workers/tasks.py`).** ✅ Full pipeline: issue → clone →
    branch → index → agent → submit. Workspace + sandbox teardown in `finally`.
 2. **M2 — Sandbox integration.** ✅ `use_sandbox` threaded through the orchestrator;
-   Docker socket mounted in Compose. *(Cloud story still open — D10.)*
+   Docker socket mounted in Compose. *(Same shape in the cloud — D10 decided, §10.)*
 3. **M3 — API + webhooks (`app/main.py`).** ✅ HMAC, dedupe, enqueue, manual trigger,
    read API, health probes.
 4. **M4 — Persistence & idempotency.** ✅ SQLAlchemy models, 3 Alembic migrations,
@@ -827,17 +951,19 @@ show `max_tokens` truncation); `provider.count_tokens` kept but unused by `Budge
 ### Next
 11. **§21 Phase 0 — run it against real issues.** Nothing in §22 blocks this any more.
     Set `AGENT_REPO_ALLOWLIST` first (§25.1).
-12. **M10 (rest) — persistent slug-keyed index.** Needs D19; do it after Phase 0 tells
-    you how slow indexing really is.
+12. **M10 — Index lifecycle.** ✅ **(v3.4)** F9 closed; D19 decided as in-memory.
 
 ### Then — the remaining roadmap
 > Numbered M13+ so they never collide with the remediation milestones M6–M12 in §23.
 
-13. **M13 — Webhook setup script.** `scripts/setup_webhook.sh --repo owner/name
-    --agent-url https://.../webhooks/github`, registering the hook via the GitHub API
-    so there is no manual per-repo config. *(~half a day.)*
-14. **M14 — Cloud deploy.** §21 Phase 2 — Azure Container Apps. Requires D10 resolved
-    and M9 done.
+13. **M13 — Webhook setup script.** ✅ **(v3.6)** `scripts/setup_webhook.sh --repo
+    owner/name --url https://host` registers the hook via the GitHub API, so there is no
+    manual per-repo config. Also `--list`, `--ping`, `--delete`. Idempotent **by webhook
+    path**, not full URL, so restarting ngrok updates the existing hook instead of
+    piling up dead ones. Subscribes to `issues` only — the sole actionable event today
+    (M16 will add `check_suite`). Verified against the live API.
+14. **M14 — Cloud deploy.** §21 Phase 2 — a single VM running the existing compose
+    stack, behind TLS. D10 and M9 are both done, so this is unblocked.
 15. **M15 — Observability & artifacts.** §21 Phase 3 — start with the platform's
     built-in logs/metrics and **one real alert**; graduate to Prometheus/OTel/Grafana
     only when the built-ins bind. Add object-store artifact upload (§7.4).
@@ -878,9 +1004,16 @@ curl -XPOST localhost:8000/runs -H 'content-type: application/json' \
      -d '{"repo":"owner/name","issue_number":42}'
 
 # ── Live webhook (local) ──
-ngrok http 8000
-# register the ngrok URL + GITHUB_WEBHOOK_SECRET as a webhook on a test repo
+ngrok http 8000                                    # note the https URL it prints
+bash scripts/setup_webhook.sh --repo owner/name --url https://<id>.ngrok-free.app
+bash scripts/setup_webhook.sh --repo owner/name --ping    # expect a 204 delivery
+bash scripts/setup_webhook.sh --repo owner/name --list    # shows the last delivery
 ```
+
+> The script reads `GITHUB_TOKEN` (needs `admin:repo_hook`) and
+> `GITHUB_WEBHOOK_SECRET` from `.env`, and prints neither. It matches an existing hook
+> by **path**, so re-running it after an ngrok restart updates that hook's URL rather
+> than adding a second one.
 
 ```bash
 # ── Integration tests (offline, no API key) ──
@@ -921,9 +1054,9 @@ curl "localhost:8000/runs/<run_id>/steps?agent=planner"
 > phases in order — each is a hard prerequisite for the next.**
 
 ### Phase 0 — Prove the agent works (before touching cloud at all)
-Run the Compose stack; `ngrok http 8000`; register a real webhook on a low-stakes test
-repo; open 5–10 real issues of varying difficulty and watch what the agent produces.
-**Do not move to Phase 1 until it resolves issues reliably.**
+Run the Compose stack; `ngrok http 8000`; register the webhook with
+`scripts/setup_webhook.sh` (M13); open 5–10 real issues of varying difficulty and watch
+what the agent produces. **Do not move to Phase 1 until it resolves issues reliably.**
 
 > **v3.3 amendment: Phase 0 is ready to run.** The Planner sees the code, the Reviewer
 > sees the whole diff, every run is inspectable via `GET /runs/{id}/steps`, and the
@@ -934,39 +1067,74 @@ repo; open 5–10 real issues of varying difficulty and watch what the agent pro
 > will return 503 without it.
 
 ### Phase 1 — Close the gaps before anything goes public
-1. **Auth + allowlist on `POST /runs`** (F8) — a shared-secret header plus a repo
-   allowlist.
-2. **Resolve D10 — sandbox in the cloud.** Container Apps gives no host Docker socket.
-   Evaluate rootless DinD; a subprocess sandbox (`nsjail`/`bubblewrap`) needing no
-   daemon; or running unsandboxed against **trusted repos only**, restoring isolation
-   at Phase 4. Record the decision in §10 and update `agent/sandbox.py`.
-3. **Pin `requirements.txt`** (F16) — cloud builds must be reproducible.
+1. ✅ **Auth + allowlist on `POST /runs`** (F8) — done in v3.3.
+2. ✅ **D10 resolved: a dedicated VM with a real Docker daemon** (§10). No code change
+   to `agent/sandbox.py` is needed, which is the entire point of the choice.
+3. ✅ **Pin `requirements.txt`** (F16) — done in v3.3.
 
-### Phase 2 — First real deployment: Azure Container Apps
-PaaS, not Kubernetes: hand it an image, it handles servers, networking, and scaling —
-the fastest path from "works locally" to "running unattended".
-1. Push `api`, `worker`, `sandbox` images to **Azure Container Registry**.
-2. Provision **Azure Database for PostgreSQL** (Flexible Server) and **Azure Cache for
-   Redis**.
-3. Deploy `api` and `worker` as two Container Apps, wired via env vars / Key Vault
-   secrets. **Mount a persistent volume for `CHROMA_DIR`** if D19 lands as "per-repo
-   persistent".
-4. Point the real GitHub webhook at the Azure URL; retire ngrok.
-5. Let it run unattended for a few days on the test repo.
-Uses the $100 GitHub Student Pack Azure credit. *Learning focus: container registries,
-managed databases, cloud secrets, what PaaS means between raw VMs and K8s.*
+### Phase 2 — First real deployment: a single VM running the existing compose stack
+
+**Why a VM and not a PaaS.** This was reconsidered on 2026-07-31 and the answer changed.
+The earlier plan targeted Azure Container Apps, which offers no host Docker socket — so
+it would have forced the sandbox to be replaced or abandoned, and the abandonment option
+meant running untrusted repository code with no isolation at all. A plain VM has a real
+Docker daemon, so `agent/sandbox.py` runs **unchanged**: `--network none`, read-only host
+FS, the `.git` tmpfs mask, dropped capabilities, resource caps. That preserves the whole
+§9 threat model, including the H1 escape fix, which is worth far more than the
+operational convenience PaaS would have bought.
+
+It is also a genuine 1:1 with local: `docker-compose.yml` already works and already
+mounts the socket. There is almost no new abstraction to learn, which is exactly what
+this phase should optimise for.
+
+**Steps**
+1. Provision a small VM (Azure B-series on the Student Pack credit, an EC2 instance, or
+   a DigitalOcean droplet — any of them, this is not a differentiated choice). Install
+   Docker Engine + the compose plugin.
+2. **Lock the box down first:** firewall to ports 22 and 443 only — **never expose 8000
+   directly**; SSH by key; unattended security upgrades on.
+3. Clone the repo, create `.env` from your local one, **regenerating every secret**
+   (`AGENT_API_TOKEN`, `GITHUB_WEBHOOK_SECRET`). Set `AGENT_REPO_ALLOWLIST`.
+4. **Add TLS — the one genuinely new piece of work.** GitHub will not send a webhook to
+   `http://`, and the stack is plain HTTP on `:8000` with no reverse proxy. Add Caddy to
+   the compose file (≈5 lines, automatic Let's Encrypt) in front of `api`, and stop
+   publishing `8000` on the host.
+5. **Decide where Postgres lives** (see the data note below).
+6. `docker compose up -d`, then `curl https://<host>/readyz`.
+7. Point the webhook at it: `scripts/setup_webhook.sh --repo owner/name --url
+   https://<host>` — the script updates the existing ngrok hook in place rather than
+   adding a second one. Then `--ping` to confirm delivery. Retire ngrok.
+8. Let it run unattended for a few days on the test repo.
+
+**Data — do not skip this.** `postgres_data` is a compose volume on the VM's disk, so
+losing the instance loses your entire run history, which is the audit trail this whole
+persistence layer exists to provide. Either point `DATABASE_URL` at a managed Postgres
+and run only `api` + `worker` + `redis` in compose (cleaner, barely more expensive), or
+schedule `pg_dump` to object storage. No volume is needed for the vector store — D19
+landed as in-memory (§7.3) — but a volume for `EMBEDDING_CACHE_DIR` is worth having,
+since that cache is what keeps re-indexing cheap.
+
+**What you are taking on.** You now own a machine: OS patching, firewall, log rotation,
+disk usage, reboots. PaaS did that invisibly. This is the honest recurring cost of
+keeping the sandbox, and it is the right trade — but it is not free.
+
+*Learning focus: real ops — TLS and certificates, firewalls, systemd, backups, and what
+"you own the host" actually means. Arguably more foundational than PaaS, and a better
+run-up to Phase 4 than Container Apps would have been.*
 
 ### Phase 3 — Observability, now earned
-Start with Container Apps' **built-in logs and metrics** — they answer ~80% of
-questions with zero setup. Add **one real alert** ("a run failed" / "a run cost > $1").
+Start with `docker compose logs` and the VM provider's built-in host metrics (CPU,
+memory, disk) — they answer ~80% of questions with zero setup. **Watch disk**: it is
+the failure mode a single VM actually hits, via logs and Docker images. Add **one real alert** ("a run failed" / "a run cost > $1").
 Graduate to Prometheus + Grafana + OTel traces only once the built-ins bind. *Learning
 focus: the difference between logs, metrics, and traces in practice.*
 
 ### Phase 4 — Kubernetes, deliberately, as its own project
-Migrate the now-proven, now-live system from Container Apps to **AKS**. Because it
-already works on Container Apps, this is a **learning exercise with a safety net**.
-This is where `k8s/` and `helm/` get built for real. AKS also makes D10 easier —
-node-pool socket access or DinD sidecars that Container Apps can't support.
+Migrate the now-proven, now-live system from the VM to **AKS**. Because it already
+works on the VM, this is a **learning exercise with a safety net** — if AKS goes
+sideways the VM keeps serving. This is where `k8s/` and `helm/` get built for real.
+It is also the natural place to improve on D10's host socket: per-run Kubernetes Jobs
+give each run its own isolated execution context instead of a shared daemon.
 
 ### Phase 5 — CI/CD
 GitHub Actions: lint + `pytest` (§24 — needs M8 to be worth anything) → build 3 images
@@ -996,10 +1164,9 @@ reviewed without seeing the new files, and the accounting didn't add up — so t
 multi-agent split was paying three models' worth of cost for roughly one model's worth
 of signal.
 
-**Status as of v3.3:** ✅ **15 of 16 findings closed.** F1–F8 and F10–F16 are all
-fixed and covered by tests. **F9 is half-closed** — the per-run leak is fixed, but the
-full-repo re-embed on every issue needs `[DECISION D19]` from the owner (§25).
-Nothing here blocks Phase 0 any more.
+**Status as of v3.4:** ✅ **all 16 findings closed**, every one covered by a test that
+was confirmed to fail against the pre-fix code. Nothing in this audit blocks §21 Phase 0.
+What remains is decisions, not defects — see §25.
 
 ### ✅ Critical — ALL FIXED in v3.1 (M6)
 
@@ -1124,24 +1291,74 @@ enforces its own budget. Adequate for now; revisit if you scale the API out.
 **Tests:** six checks in the `app.main` self-test — missing token → 401, wrong token →
 401, both header forms → 202, non-allowlisted repo → 403, limit → 429, unset token → 503.
 
-**F9 — The vector store grows without bound and re-embeds everything every run.**
-🟡 **HALF FIXED — the leak is closed; the re-embed needs `[DECISION D19]` (§25).**
-**Fix applied:** `retrieval.drop_repo(root)` deletes every chunk indexed under a path,
-and the orchestrator calls it during cleanup before deleting the workspace. The
-collection no longer accumulates a full copy of the repository per run.
-**Still open:** because the index is keyed on the ephemeral workspace path, each run
-still re-embeds the entire repository from scratch. Fixing that means keying the index
-on the **repo slug** so it persists and is genuinely incremental — a design change with
-a real consequence (staleness handling, a persistent volume in §21 Phase 2), so it is
-the owner's call.
+**F9 — The vector store grew without bound and re-embedded everything every run.**
+✅ **FIXED (v3.3 + v3.4), `[DECISION D19]` decided: in-memory.**
+One global collection `'code'`, with each run indexing from a unique ephemeral path
+(`.../workspaces/{run_id}/repo`), so every run wrote a *complete new copy* of the repo's
+chunks under a new key and cleanup never removed them — ~100 runs on a 1000-chunk repo
+left ~100k permanently dead chunks. Query *results* were always safe (the `repo`
+metadata filter works), so this was cost, latency, and storage rather than correctness.
+**Fix applied, in two steps.** v3.3 added `retrieval.drop_repo(root)`, called during
+cleanup, so a run's chunks no longer outlive it. v3.4 went further and made the store
+**ephemeral** (`chromadb.EphemeralClient()`), deleting `CHROMA_DIR` and the on-disk
+`.chroma` store entirely.
+
+The second step is the more interesting one, because it reframes the finding. The
+original plan called for "one collection per repo, persisted, incremental across runs" —
+but that is not what this design wants. Every run clones into a *unique* workspace and
+indexes under that path, so an on-disk store only ever held data that was about to be
+deleted. Persisting it bought no reuse whatsoever, and cost: a worker dying before
+cleanup orphaned vectors on disk permanently, two workers in one container contended
+over the same files, and Phase 2 would have needed a volume provisioned for it. In
+memory, a dead process takes its index with it — the failure mode cannot exist.
+
+`drop_repo()` is still called, because a Celery worker is long-lived across many runs:
+ephemeral storage bounds growth to a process lifetime, the drop bounds it to one run.
+And the persistence that *does* pay for itself — the content-hash embedding cache — is
+untouched, so unchanged files still skip the model on every subsequent run.
+**Trade-off accepted:** the repo is re-indexed per run. Measure in Phase 0 before
+optimising.
 **Test:** `test_vector_index_is_dropped_on_cleanup`.
-One global collection `'code'`; each run indexes from a unique ephemeral path
-(`.../workspaces/{run_id}/repo`), so every run writes a *complete new copy* of the
-repo's chunks under a new key, and cleanup never removes them. ~100 runs on a
-1000-chunk repo leaves ~100k permanently dead chunks. Query *results* are safe (the
-`repo` metadata filter works), so this is cost/latency/storage, not correctness.
-**Fix (D19):** key the index on the repo slug so it persists and is genuinely
-incremental, or delete `where={'repo': ...}` during cleanup.
+
+### 🟠 Added 2026-07-31 — found while implementing per-role model config
+
+**F17 — A model name could leak across providers.** ✅ **FIXED**
+Both adapters resolved their model as `model or os.getenv("LLM_MODEL", <default>)`.
+So with the global config on Gemini and only `PLANNER_PROVIDER=anthropic` set — exactly
+the override D20 recommends — the Planner built the **Anthropic** adapter and handed it
+the **Gemini** `LLM_MODEL`, calling the Anthropic API with `gemini-3.5-flash-lite`.
+Confirmed by direct construction before the fix. It would have failed at the first live
+Planner call with a confusing upstream error, and only for the mixed-provider setup, so
+it would have looked like a provider outage rather than a config bug.
+
+Two related gaps surfaced with it: the **Coder had no per-role override at all**
+(`ReActAgent` called bare `get_provider()`), and the **Reviewer chained through
+`PLANNER_*`**, so configuring the Planner silently reconfigured the Reviewer.
+
+**Fix applied:** all resolution moved into `agent/providers/resolve_role(role)`, one
+implementation for all three roles: role-specific var → global `LLM_*` → a hardcoded
+non-empty default. A global model is inherited **only when the resolved provider matches
+the global provider**, so an id never crosses providers. `CODER_PROVIDER` /
+`CODER_MODEL` added; the Reviewer's chain through `PLANNER_*` removed. Unknown provider
+names now raise instead of silently falling back, so a typo fails loudly.
+`get_provider()` applies the same rule, protecting direct callers like the CLI.
+**Tests:** `tests/test_provider_resolution.py`, 15 tests covering all three roles,
+the never-empty guarantee, cross-provider isolation, and validation.
+
+**F18 — A model missing from `PRICING` was silently costed at ~22× its real rate.**
+✅ **FIXED**
+`cost_usd()` fell back to `PRICING.get(self.model, (1.25, 10.0))` — the *pro* rate — with
+no signal. `gemini-3.5-flash-lite`, the model actually configured, had no entry, so every
+run was priced at $11.25 per 1M/1M instead of $0.50. Two consequences: the cost in every
+PR footer and `runs.cost_usd` was inflated, and `MAX_USD` tripped roughly 22× too early,
+cutting runs short for no reason. Nothing in the logs said so.
+**Fix applied:** entries added for every model in the current catalogue tier
+(pro / flash / flash-lite). The fallback stays at the pro rate — over-estimating is the
+safe direction for a spend cap — but now **logs a warning once per model**, so the next
+model change cannot reintroduce this silently.
+**Caveat:** the rates themselves still cannot be verified programmatically; the API
+exposes ids and token limits, not prices. Check them against the pricing page before
+relying on `MAX_USD`.
 
 ### 🟡 Medium — correctness, quality, and hygiene
 
@@ -1289,10 +1506,11 @@ pin `requirements.txt`.
 the `app.main` self-test. **Remaining caveat:** the rate limit is per API process, not
 distributed.
 
-### 🟡 M10 — Index lifecycle *(F9, D19)* — **half done (v3.3)**
-✅ `retrieval.drop_repo()` + cleanup call closes the unbounded-growth leak.
-🔶 **Still needs D19:** keying the index on the repo slug so it persists across runs and
-stops re-embedding the whole repository every issue. See §25.
+### ✅ M10 — Index lifecycle *(F9, D19)* — **DONE (v3.3 + v3.4)**
+`retrieval.drop_repo()` clears a run's chunks at cleanup, and the store itself is now
+**in-memory** (`EphemeralClient`, no `CHROMA_DIR`) — D19 decided as ephemeral rather
+than slug-keyed persistent, because persistence bought no reuse in this design and cost
+real failure modes (§7.3). The persisted embedding cache is untouched.
 
 ### ✅ M11 — Quality polish *(F12, F13, F14, F15)* — **DONE (v3.3)**
 Guardrail paths normalised and deviations surfaced to the model, the trace, and the PR;
@@ -1377,35 +1595,26 @@ needs your input, roughly in the order it will bite.
 
 ### 25.1 Blocking the next milestone
 
-**`[D10]` — how the sandbox runs in the cloud.** *Blocks §21 Phase 2.* Azure Container
-Apps gives no host Docker socket, which is how the sandbox works today. Options:
-rootless Docker-in-Docker inside the worker; replace Docker with a daemon-free
-subprocess sandbox (`nsjail` / `bubblewrap`); or run **unsandboxed against trusted repos
-only** and restore isolation at AKS (Phase 4). *Recommendation: the third, for your own
-repositories, with the allowlist enforced — it is honest about the trade and unblocks
-everything else. Do not point it at a repo you did not write until this is resolved.*
+**Nothing is blocking.** Every decision in §16 is settled and every §22 finding is
+closed. What is left is execution, in this order:
 
-**`AGENT_REPO_ALLOWLIST` — set it before the first tunnel.** Currently unset, which
-means no restriction. `.env` has a commented line ready. This is one line and it is the
-difference between "the agent works on my repo" and "the agent works on whatever a
-leaked token asks for".
+1. **§21 Phase 0** — run the stack locally, register the webhook with
+   `scripts/setup_webhook.sh`, open real issues, watch what the agent produces.
+2. **§21 Phase 2** — the VM deploy (D10 decided, §10). The only genuinely new piece of
+   work in it is **TLS**: GitHub will not post a webhook to `http://`, and the stack is
+   plain HTTP on `:8000` today. Add Caddy in front of `api` and stop publishing 8000.
+3. Decide **where Postgres lives** on the VM before you rely on the run history —
+   managed instance or scheduled `pg_dump`. A compose volume on a single disk is not a
+   backup (§21 Phase 2, "Data").
 
 ### 25.2 Cost and quality
 
-**`[D20]` — model per role.** `.env` currently runs *all three agents* on
-`gemini-3.5-flash-lite`. That is a reasonable Coder and a weak Reviewer, and review
-quality is the entire justification for having a third agent. *Recommendation: keep the
-cheap model for the Coder loop, which dominates token spend, and set `PLANNER_MODEL` /
-`REVIEWER_MODEL` to the strongest model you will pay for.* Also re-validate every model
-id against the provider's current catalogue before the first cloud deploy — the ids in
-this repo predate several releases.
+*(`[D20]` was the last open decision and is now settled — see §6.6. Ids were taken from
+the account's live catalogue via `client.models.list()`, not from any document.)*
 
-**`[D19]` — vector index lifecycle.** The leak is fixed (F9), but every run still
-re-embeds the entire repository because the index is keyed on the per-run workspace
-path. Keying it on the **repo slug** would make it persist and be genuinely incremental
-— much faster and cheaper per issue — but adds staleness handling (invalidate on commit
-change) and needs a persistent volume in Phase 2. *Recommendation: do it, but only once
-Phase 0 has told you how slow indexing actually is in practice. Premature until then.*
+*(`[D19]` was open here in v3.3 and is now decided — the vector store is in-memory, see
+§7.3. Revisit only if Phase 0 shows per-run indexing to be slow in practice, and measure
+before changing anything.)*
 
 ### 25.3 Optional, not urgent
 

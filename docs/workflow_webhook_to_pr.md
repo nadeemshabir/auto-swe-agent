@@ -7,38 +7,40 @@ This document provides a comprehensive, step-by-step description of the executio
 ```mermaid
 sequenceDiagram
     autonumber
-    actor GitHub as GitHub Webhook
-    participant Gateway as FastAPI Gateway<br/>(app/main.py)
-    participant Broker as Redis / Celery<br/>(workers/tasks.py)
-    participant DB as PostgreSQL<br/>(db/models.py)
-    participant Planner as Planner Agent<br/>(agent/planner.py)
-    participant LocalGit as Git & Indexer<br/>(agent/github.py & retrieval.py)
-    participant Sandbox as Docker Sandbox<br/>(agent/sandbox.py)
-    participant Coder as Coder Agent (ReAct)<br/>(agent/loop.py)
-    participant Reviewer as Reviewer Agent<br/>(agent/reviewer.py)
-    participant GHRest as GitHub REST API
+    actor GitHub as "GitHub Webhook"
+    participant Gateway as "FastAPI Gateway (app/main.py)"
+    participant Broker as "Redis / Celery (workers/tasks.py)"
+    participant DB as "PostgreSQL (db/models.py)"
+    participant LocalGit as "Git & Indexer (agent/github.py & retrieval.py)"
+    participant Planner as "Planner Agent (agent/planner.py)"
+    participant Sandbox as "Docker Sandbox (agent/sandbox.py)"
+    participant Coder as "Coder Agent ReAct (agent/loop.py)"
+    participant Reviewer as "Reviewer Agent (agent/reviewer.py)"
+    participant GHRest as "GitHub REST API"
 
     GitHub->>Gateway: POST /webhooks/github (HMAC Signature)
     Gateway->>Gateway: _verify_signature() & parse_webhook_event()
     Gateway->>DB: Check WebhookEvent (deduplication)
-    Gateway->>Broker: run_issue.delay(repo, issue_number, use_sandbox)
+    Gateway->>Gateway: Mint run_id (UUID)
+    Gateway->>Broker: run_issue.delay(repo, issue_number, use_sandbox, run_id)
     Gateway-->>GitHub: 202 Accepted (run_id)
 
     Broker->>DB: Persist Run record (status="running")
     Broker->>GHRest: client.get_issue(repo, issue_number)
     GHRest-->>Broker: Issue metadata
 
-    Broker->>Planner: run_planner(issue_task)
-    Planner-->>Broker: PlannerOutput (understanding, steps, hypothesis)
+    Broker->>LocalGit: clone() & create_branch("agent/issue-N")
+    Broker->>LocalGit: index_repo() (Tree-Sitter + ChromaDB Ephemeral)
+
+    Broker->>Planner: run_planner(issue_task, workspace)
+    LocalGit-->>Planner: Codebase retrieval (top-k chunks)
+    Planner-->>Broker: PlannerOutput (understanding, steps, hypothesis, test_strategy)
     Broker->>DB: Persist Planner Step
     Broker->>GHRest: client.comment_on_issue() [Pre-work comment]
 
-    Broker->>LocalGit: clone() & create_branch("agent/issue-N")
-    Broker->>LocalGit: index_repo() (Tree-Sitter + ChromaDB)
-
     opt If use_sandbox == True
         Broker->>Sandbox: Sandbox(workspace).start()
-        Sandbox->>Sandbox: Spin up Docker container<br/>(--network none, --read-only, --user non-root,<br/>-v workspace:/work:rw, --tmpfs /work/.git:ro)
+        Sandbox->>Sandbox: Spin up Docker container (--network none, --read-only, --user non-root)
     end
 
     Broker->>Coder: ReActAgent.run_with_plan(task, plan, sandbox)
@@ -47,7 +49,7 @@ sequenceDiagram
         alt Tool == run_tests (Sandboxed execution)
             Coder->>Sandbox: sandbox.run_tests(target)
             Sandbox->>Sandbox: docker exec aswe-sbx-XXX pytest
-            Sandbox-->>Coder: ExecResult (exit code + formatted stdout/stderr)
+            Sandbox-->>Coder: ExecResult (exit code + stdout/stderr)
         else Host file inspection/edit
             LocalGit-->>Coder: File content / edit status
         end
@@ -55,13 +57,13 @@ sequenceDiagram
     end
     Coder-->>Broker: RunResult (completed, final_text)
 
-    Broker->>LocalGit: git diff
+    Broker->>LocalGit: _capture_diff() (git add -A && git diff --cached)
     Broker->>Reviewer: run_reviewer(task, plan, diff, test_output)
     Reviewer-->>Broker: ReviewerOutput (verdict: approve/request_changes)
     Broker->>DB: Persist Reviewer Step
 
     alt Verdict == request_changes (up to MAX_REVIEW_ROUNDS)
-        Broker->>Coder: agent.run(feedback_task)
+        Broker->>Coder: agent.run(feedback_task with prior diff & feedback)
         Coder->>Sandbox: Re-run sandboxed tests as needed
     end
 
@@ -73,8 +75,8 @@ sequenceDiagram
     opt If use_sandbox == True
         Broker->>Sandbox: sandbox.close() (docker rm -f container)
     end
+    Broker->>LocalGit: drop_repo() & Cleanup workspace
     Broker->>DB: Final update (status="completed", pr_url, cost, finished_at)
-    Broker->>LocalGit: Cleanup workspace directory
 ```
 
 ---
@@ -94,8 +96,8 @@ sequenceDiagram
    - Queries `db.models.WebhookEvent` by `delivery_id`. If already processed, returns `202 Accepted` ("duplicate webhook ignored").
 4. `parse_webhook_event(payload, event_type)` (`agent/github.py:L483`)
    - Validates event payload: checks `event_type == "issues"`, verifies action is actionable (`opened`, `reopened`, `labeled`), skips pull requests, and excludes Bot authors (`user.type == "Bot"`).
-5. `run_issue.delay(issue.repo, issue.number, use_sandbox)` (`workers/tasks.py:L156`)
-   - Enqueues task asynchronously to Redis broker and returns `202 Accepted` with `run_id`.
+5. `_enqueue_run(repo, issue_number, use_sandbox)` (`app/main.py`)
+   - Mints `run_id = uuid.uuid4()`, enqueues task asynchronously to Redis broker (`run_issue.delay(repo, issue_number, use_sandbox, run_id)`), and returns `202 Accepted` with `run_id`.
 
 ---
 
@@ -104,44 +106,20 @@ sequenceDiagram
 * **Purpose:** Celery worker picks up the job, initializes state, and records tracking metadata in PostgreSQL.
 
 #### Key Functions & Code References:
-1. `run_issue(self, repo, issue_number, use_sandbox)` (`workers/tasks.py:L156`)
-   - Core Celery task function. Generates `run_id = uuid.uuid4()`.
-2. `_persist_run(session, run_db)` (`workers/tasks.py:L63`)
-   - Inserts or updates a row in the `runs` PostgreSQL table (`db.models.Run`) with status `"running"`, provider, and model details.
-3. **Idempotency Guard** (`workers/tasks.py:L228-L238`)
-   - Checks if an active run already exists for `(repo, issue_number)` with status `"running"`. If so, skips execution to prevent concurrent duplicate agent runs.
+1. `run_issue(self, repo, issue_number, use_sandbox, run_id)` (`workers/tasks.py:L248`)
+   - Core Celery task function. Resolves `run_id` passed from API gateway.
+2. `Run(id=run_id, repo=repo, issue_number=issue_number, status="running")` (`workers/tasks.py:L354`)
+   - Inserts append-only row into PostgreSQL table (`db.models.Run`) with status `"running"`, provider, and model details.
+3. **Idempotency Guard & Race Arbiter** (`workers/tasks.py:L338-L374`)
+   - Checks if an active run already exists for `(repo, issue_number)` with status `"running"`. Enforces single active run via partial unique index in DB.
 4. `client.get_issue(repo, issue_number)` (`agent/github.py:L276`)
    - Fetches issue title, description, and labels using `GitHubClient`. Converts API dict into `Issue` dataclass.
 
 ---
 
-### Stage 3: Stage 1 Multi-Agent — Planner Agent Analysis
-* **Primary Module:** `agent/planner.py`
-* **Purpose:** Perform static reasoning on the issue context to generate a structured implementation plan without editing files.
-
-#### Key Functions & Code References:
-1. `run_planner(issue_text, workspace, skip_retrieval)` (`agent/planner.py:L153`)
-   - Executes a single structured LLM call (using `PLANNER_PROVIDER` / `PLANNER_MODEL`).
-2. `_get_planner_provider()` (`agent/planner.py:L98`)
-   - Resolves LLM provider instance (e.g. Anthropic Claude Opus or Google Gemini Pro).
-3. `PlannerOutput.from_llm_text(resp.text)` (`agent/schemas.py`)
-   - Parses LLM JSON response into a structured schema containing:
-     - `understanding`
-     - `root_cause_hypothesis`
-     - `files_to_touch`
-     - `plan_steps`
-     - `test_strategy`
-     - `risk_notes`
-4. `_persist_agent_step(session, run_id, step_n, "planner", plan_dict)` (`workers/tasks.py:L116`)
-   - Stores Planner output in the `run_steps` database table for auditability.
-5. `client.comment_on_issue(repo, issue_number, comment_body)` (`agent/github.py:L294`)
-   - Posts a pre-work comment on GitHub notifying maintainers that the agent is starting work along with its understanding and plan.
-
----
-
-### Stage 4: Workspace Preparation, Branching & Codebase Indexing
+### Stage 3: Workspace Preparation, Branching & Codebase Indexing
 * **Primary Modules:** `agent/github.py`, `agent/retrieval.py`
-* **Purpose:** Clone the repository, create a dedicated git branch, and index the codebase for vector search.
+* **Purpose:** Clone the repository, create a dedicated git branch, and index the codebase in memory for vector search.
 
 #### Key Functions & Code References:
 1. `clone(repo, workspace, token)` (`agent/github.py:L595`)
@@ -154,7 +132,31 @@ sequenceDiagram
 4. `create_branch(workspace, branch)` (`agent/github.py:L636`)
    - Cuts branch from default branch (`main` / `master`).
 5. `retrieval.index_repo(str(workspace))` (`agent/retrieval.py`)
-   - Parses code files using Tree-Sitter, builds semantic code chunks, generates vector embeddings (SentenceTransformers), and indexes into ChromaDB.
+   - Parses code files using Tree-Sitter, builds semantic code chunks, generates vector embeddings (SentenceTransformers), and indexes into ChromaDB (`EphemeralClient`).
+
+---
+
+### Stage 4: Stage 1 Multi-Agent — Planner Agent Analysis
+* **Primary Module:** `agent/planner.py`
+* **Purpose:** Perform static reasoning on the issue text and retrieved codebase context to generate a structured implementation plan.
+
+#### Key Functions & Code References:
+1. `run_planner(issue_task, workspace, budget)` (`agent/planner.py:L153`)
+   - Runs **after** codebase indexing so top-k relevant chunks are retrieved to ground `files_to_touch` and `plan_steps`.
+2. `_get_planner_provider()` (`agent/planner.py:L98`)
+   - Resolves LLM provider instance (e.g. Anthropic Claude Opus or Google Gemini Pro).
+3. `PlannerOutput.from_llm_text(resp.text)` (`agent/schemas.py`)
+   - Parses LLM JSON response into a structured schema containing:
+     - `understanding`
+     - `root_cause_hypothesis`
+     - `files_to_touch`
+     - `plan_steps`
+     - `test_strategy`
+     - `risk_notes`
+4. `_persist_agent_step(session, run_id, step_n, "planner", plan_dict)` (`workers/tasks.py:L107`)
+   - Stores Planner output in `run_steps` database table.
+5. `client.comment_on_issue(repo, issue_number, comment_body)` (`agent/github.py:L294`)
+   - Posts pre-work comment on GitHub notifying maintainers that agent is starting work along with its understanding and plan.
 
 ---
 

@@ -37,9 +37,21 @@ x-agent-env: &agent-env
   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
   GEMINI_API_KEY: ${GEMINI_API_KEY:-}
 
+  # Multi-agent role overrides
+  PLANNER_PROVIDER: ${PLANNER_PROVIDER:-}
+  PLANNER_MODEL: ${PLANNER_MODEL:-}
+  CODER_PROVIDER: ${CODER_PROVIDER:-}
+  CODER_MODEL: ${CODER_MODEL:-}
+  REVIEWER_PROVIDER: ${REVIEWER_PROVIDER:-}
+  REVIEWER_MODEL: ${REVIEWER_MODEL:-}
+
   # ── GitHub ────────────────────────────────────────────────────────────────
   GITHUB_TOKEN: ${GITHUB_TOKEN:-}
   GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+
+  # ── Security & Allowlist ──────────────────────────────────────────────────
+  AGENT_API_TOKEN: ${AGENT_API_TOKEN:-}
+  AGENT_REPO_ALLOWLIST: ${AGENT_REPO_ALLOWLIST:-}
 
   # ── Budget ────────────────────────────────────────────────────────────────
   MAX_STEPS: ${MAX_STEPS:-30}
@@ -55,6 +67,11 @@ x-agent-env: &agent-env
   DATABASE_URL: postgresql://agent:agent@postgres:5432/auto_swe_agent
 
   # ── Sandbox ───────────────────────────────────────────────────────────────
+  # Off by default. Read by app/main.py to decide whether webhook-triggered runs
+  # execute tests in the hardened container (plan2.md §10, D10). Turning it on is
+  # a config change only — but the host needs a Docker daemon, and the sandbox
+  # image must carry the target repo's test deps (D9).
+  USE_SANDBOX: ${USE_SANDBOX:-false}
   SANDBOX_IMAGE: ${SANDBOX_IMAGE:-auto-swe-sandbox:latest}
   WORKSPACE_ROOT: /var/agent/workspaces
 

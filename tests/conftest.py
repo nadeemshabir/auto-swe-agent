@@ -237,7 +237,8 @@ class Harness:
         mp.setattr(retrieval_mod, "drop_repo", spy_drop)
         mp.setattr(planner_mod, "run_planner", spy_planner)
         mp.setattr(reviewer_mod, "run_reviewer", spy_reviewer)
-        mp.setattr(loop_mod, "get_provider", lambda *a, **k: FakeProvider(coder_calls))
+        mp.setattr(loop_mod, "get_provider_for_role",
+                   lambda *a, **k: FakeProvider(coder_calls))
 
         import workers.tasks as wt
         mp.setattr(wt, "WORKSPACE_ROOT", self._tmp / f"{name}-ws")

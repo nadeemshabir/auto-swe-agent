@@ -28,10 +28,89 @@ The system has six layers, each independently testable and deployable:
 
 1. **GitHub Integration** - webhooks, issue parsing, repo cloning, PR creation
 2. **Codebase Understanding** - AST parsing, embedding, vector search, call graph analysis 
-3. **Planning & Reasoning** - ReAct loop (Reason → Act → Observe), tools, memory, budget
+3. **Planning & Reasoning** - Multi-agent design (Planner → Coder ReAct loop → Reviewer) with shared token & monetary budget
 4. **Sandboxed Execution** - isolated Docker containers, network/filesystem constraints 
 5. **Backend & Queue** - FastAPI orchestrator, Celery workers, Redis broker, PostgreSQL store
 6. **Observability & DevOps** - metrics, traces, logs, dashboards, Kubernetes, CI/CD
+
+### End-to-End Webhook-to-PR Workflow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor GitHub as "GitHub Webhook"
+    participant Gateway as "FastAPI Gateway (app/main.py)"
+    participant Broker as "Redis / Celery (workers/tasks.py)"
+    participant DB as "PostgreSQL (db/models.py)"
+    participant LocalGit as "Git & Indexer (agent/github.py & retrieval.py)"
+    participant Planner as "Planner Agent (agent/planner.py)"
+    participant Sandbox as "Docker Sandbox (agent/sandbox.py)"
+    participant Coder as "Coder Agent ReAct (agent/loop.py)"
+    participant Reviewer as "Reviewer Agent (agent/reviewer.py)"
+    participant GHRest as "GitHub REST API"
+
+    GitHub->>Gateway: POST /webhooks/github (HMAC Signature)
+    Gateway->>Gateway: _verify_signature() & parse_webhook_event()
+    Gateway->>DB: Check WebhookEvent (deduplication)
+    Gateway->>Gateway: Mint run_id (UUID)
+    Gateway->>Broker: run_issue.delay(repo, issue_number, use_sandbox, run_id)
+    Gateway-->>GitHub: 202 Accepted (run_id)
+
+    Broker->>DB: Persist Run record (status="running")
+    Broker->>GHRest: client.get_issue(repo, issue_number)
+    GHRest-->>Broker: Issue metadata
+
+    Broker->>LocalGit: clone() & create_branch("agent/issue-N")
+    Broker->>LocalGit: index_repo() (Tree-Sitter + ChromaDB Ephemeral)
+
+    Broker->>Planner: run_planner(issue_task, workspace)
+    LocalGit-->>Planner: Codebase retrieval (top-k chunks)
+    Planner-->>Broker: PlannerOutput (understanding, steps, hypothesis, test_strategy)
+    Broker->>DB: Persist Planner Step
+    Broker->>GHRest: client.comment_on_issue() [Pre-work comment]
+
+    opt If use_sandbox == True
+        Broker->>Sandbox: Sandbox(workspace).start()
+        Sandbox->>Sandbox: Spin up Docker container (--network none, --read-only, --user non-root)
+    end
+
+    Broker->>Coder: ReActAgent.run_with_plan(task, plan, sandbox)
+    loop ReAct Tool Execution Loop
+        Coder->>LocalGit: view_file / replace_file_content / search
+        alt Tool == run_tests (Sandboxed execution)
+            Coder->>Sandbox: sandbox.run_tests(target)
+            Sandbox->>Sandbox: docker exec aswe-sbx-XXX pytest
+            Sandbox-->>Coder: ExecResult (exit code + stdout/stderr)
+        else Host file inspection/edit
+            LocalGit-->>Coder: File content / edit status
+        end
+        Coder->>DB: Persist Coder Step (incremental)
+    end
+    Coder-->>Broker: RunResult (completed, final_text)
+
+    Broker->>LocalGit: _capture_diff() (git add -A && git diff --cached)
+    Broker->>Reviewer: run_reviewer(task, plan, diff, test_output)
+    Reviewer-->>Broker: ReviewerOutput (verdict: approve/request_changes)
+    Broker->>DB: Persist Reviewer Step
+
+    alt Verdict == request_changes (up to MAX_REVIEW_ROUNDS)
+        Broker->>Coder: agent.run(feedback_task with prior diff & feedback)
+        Coder->>Sandbox: Re-run sandboxed tests as needed
+    end
+
+    Broker->>LocalGit: submit_changes() (commit_all & push)
+    Broker->>GHRest: client.create_pull_request()
+    GHRest-->>Broker: PullRequest (pr_url, pr_number)
+
+    Broker->>GHRest: client.comment_on_issue() [Final PR comment]
+    opt If use_sandbox == True
+        Broker->>Sandbox: sandbox.close() (docker rm -f container)
+    end
+    Broker->>LocalGit: drop_repo() & Cleanup workspace
+    Broker->>DB: Final update (status="completed", pr_url, cost, finished_at)
+```
+
+
 
 ## Key Features
 

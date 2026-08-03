@@ -37,9 +37,17 @@ Because calculating embeddings is computationally expensive, the engine employs 
 
 ### 4. Vector Database (`index_repo` & `retrieve`)
 
-All chunks are permanently stored in a local **ChromaDB** database located at `agent/.chroma`.
-- **Indexing (`index_repo`)**: When a file is indexed, the engine first *deletes* any existing chunks belonging to that file from ChromaDB. It then inserts the fresh chunks. This ensures that line-number shifts from editing files don't result in stale, duplicate data. Each chunk saves metadata including its file path, line numbers, and the repository it belongs to.
-- **Retrieval (`retrieve`)**: Given a natural language query, the engine embeds the query and searches ChromaDB for the closest matching code chunks. The search can be filtered by `repo` to prevent cross-pollution between different projects stored in the same database.
+Chunks are held in an **in-memory ChromaDB** collection (`chromadb.EphemeralClient()`), built fresh for each run and discarded with the process. Nothing is written to disk.
+
+**Why in-memory** (plan2.md §16 D19, §22 F9): every run clones into a unique workspace and indexes under that path, then drops the index at cleanup — so an on-disk store only ever held data that was about to be deleted. Persisting it added no reuse and one real failure mode: a worker that died before cleanup left orphaned vectors on disk forever. It also meant a persistent volume to provision in the cloud, and file contention between concurrent workers in the same container. In memory, a dead process simply takes its index with it.
+
+What actually makes re-indexing cheap is the **embedding cache** (`agent/.embedding_cache`, keyed by content hash) — that *is* persisted, so unchanged files skip the model on every subsequent run.
+
+- **Indexing (`index_repo`)**: When a file is indexed, the engine first *deletes* any existing chunks belonging to that file. It then inserts the fresh chunks, so line-number shifts from editing files don't leave stale duplicates. Each chunk saves metadata including its file path, line numbers, and the repository it belongs to.
+- **Retrieval (`retrieve`)**: Given a natural language query, the engine embeds the query and searches for the closest matching code chunks. The search is filtered by `repo` to prevent cross-pollution between projects sharing the collection.
+- **Cleanup (`drop_repo`)**: Deletes every chunk indexed under a path. Still required despite the in-memory store, because a Celery worker process is long-lived and handles many runs — this bounds the collection to one run rather than one process lifetime. The orchestrator calls it during cleanup.
+
+> **Consequence for CLI use:** an index only lives as long as the process that built it, so `python -m agent.loop` must be given `--auto-index`. The orchestrator always indexes after cloning, so the webhook pipeline is unaffected.
 
 ---
 

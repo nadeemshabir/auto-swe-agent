@@ -65,6 +65,29 @@ WORKDIR /app
 # slow to install — caching this layer saves minutes on every rebuild.
 COPY requirements.txt .
 
+# Install torch from PyTorch's CPU-only index FIRST, so the later
+# `-r requirements.txt` (which pulls sentence-transformers) finds torch already
+# satisfied and does not resolve the default GPU build from PyPI.
+#
+# Why this matters: the default torch wheel drags in the full CUDA stack —
+# ~2.7 GB of nvidia-* packages — which is dead weight here. Nothing in this
+# project uses a GPU: the only model that runs locally is the MiniLM embedder
+# (agent/retrieval.py), on CPU, and the LLMs are all remote API calls.
+#
+# Left unpinned it took the worker image to 9.74 GB — 3.19 GB with this fix.
+# Keep this above the requirements install.
+#
+# x86 only: PyTorch's CPU index does not reliably carry aarch64 wheels, and it
+# does not need to — the ARM Linux torch on PyPI is CPU-only already, since the
+# nvidia-* CUDA packages are published for x86 alone. So on ARM we let
+# requirements.txt resolve torch normally and get the same result.
+RUN if [ "$(uname -m)" = "x86_64" ]; then \
+        pip install --no-cache-dir \
+            --index-url https://download.pytorch.org/whl/cpu torch; \
+    else \
+        echo "non-x86 ($(uname -m)): PyPI torch is already CPU-only here, skipping"; \
+    fi
+
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Pre-download the sentence-transformers embedding model weights so the worker

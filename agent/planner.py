@@ -39,11 +39,11 @@ except ImportError:
     pass
 
 try:
-    from .providers import ProviderError, Usage, get_provider
+    from .providers import ProviderError, Usage, get_provider_for_role
     from .schemas import PlannerOutput
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from agent.providers import ProviderError, Usage, get_provider
+    from agent.providers import ProviderError, Usage, get_provider_for_role
     from agent.schemas import PlannerOutput
 
 log = logging.getLogger("agent.planner")
@@ -98,25 +98,12 @@ no markdown fences — just the raw JSON object starting with { and ending with 
 def _get_planner_provider():
     """Get the LLM provider for the Planner agent.
 
-    Resolution order:
-      1. PLANNER_PROVIDER + PLANNER_MODEL env vars (explicit per-agent config)
-      2. LLM_PROVIDER + LLM_MODEL env vars (shared global config)
-
-    This lets you run everything on Gemini by default, or override just the
-    Planner to use Claude Opus for higher-quality planning.
+    Resolution lives in agent.providers.resolve_role — PLANNER_PROVIDER /
+    PLANNER_MODEL, then LLM_PROVIDER / LLM_MODEL, then a hardcoded default that
+    is never empty. This lets you run everything on one cheap model by default
+    and override just the Planner to something stronger.
     """
-    planner_provider = os.getenv("PLANNER_PROVIDER", "").strip()
-    planner_model = os.getenv("PLANNER_MODEL", "").strip()
-
-    kwargs = {}
-    if planner_model:
-        kwargs["model"] = planner_model
-
-    if planner_provider:
-        return get_provider(name=planner_provider, **kwargs)
-
-    # No per-agent override — use the global defaults.
-    return get_provider(**kwargs)
+    return get_provider_for_role("planner")
 
 
 # ═════════════════════════════════════════════════════════════════════════════

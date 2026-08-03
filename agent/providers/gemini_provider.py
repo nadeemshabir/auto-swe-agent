@@ -35,14 +35,42 @@ _RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
 
 
 # Approximate input / output price per 1M tokens, for the budget USD cap only.
+#
+# VERIFY THESE against the provider's pricing page before trusting MAX_USD — the
+# API exposes model ids and token limits, not rates, so they cannot be checked
+# programmatically. They only need to be roughly right: their job is to stop a
+# runaway run, not to bill anyone.
+#
+# Keep an entry for every model named in .env. A missing one is not harmless —
+# see _DEFAULT_PRICING below.
 PRICING: dict[str, tuple[float, float]] = {
-    "gemini-3.5-flash":    (0.30, 2.50),
-    "gemini-3.1-pro":      (1.25, 10.0),
-    "gemini-3.1-flash-lite": (0.10, 0.40),
+    # pro tier
+    "gemini-3.1-pro":          (1.25, 10.0),
+    "gemini-3.1-pro-preview":  (1.25, 10.0),
+    "gemini-3-pro-preview":    (1.25, 10.0),
+    # flash tier
+    "gemini-3.6-flash":        (0.30, 2.50),
+    "gemini-3.5-flash":        (0.30, 2.50),
+    "gemini-3-flash-preview":  (0.30, 2.50),
+    # flash-lite tier
+    "gemini-3.5-flash-lite":   (0.10, 0.40),
+    "gemini-3.1-flash-lite":   (0.10, 0.40),
     # legacy (may still work for some accounts)
-    "gemini-2.5-pro":      (1.25, 10.0),
-    "gemini-2.5-flash":    (0.30, 2.50),
+    "gemini-2.5-pro":          (1.25, 10.0),
+    "gemini-2.5-flash":        (0.30, 2.50),
+    "gemini-2.5-flash-lite":   (0.10, 0.40),
 }
+
+# Fallback for a model we have no entry for. Deliberately the PRO rate: an
+# unknown model should be over-estimated, so the USD cap trips early rather than
+# letting a run overspend on a model we mispriced.
+#
+# But over-estimating silently is its own bug. `gemini-3.5-flash-lite` was
+# missing from the table above while being the configured model, so every run
+# was costed at ~4x the real rate — inflating the PR footer and tripping MAX_USD
+# far too early, with nothing in the logs to say so. Hence the warning.
+_DEFAULT_PRICING = (1.25, 10.0)
+_warned_models: set[str] = set()
 
 
 class GeminiProvider:
@@ -169,7 +197,18 @@ class GeminiProvider:
             raise ProviderError(f"Gemini count_tokens error: {e}") from e
 
     def cost_usd(self, usage: Usage) -> float:
-        p_in, p_out = PRICING.get(self.model, (1.25, 10.0))
+        prices = PRICING.get(self.model)
+        if prices is None:
+            prices = _DEFAULT_PRICING
+            if self.model not in _warned_models:
+                _warned_models.add(self.model)
+                log.warning(
+                    "no PRICING entry for %r — costing it at the pro rate %s. "
+                    "Cost figures and the MAX_USD cap will be wrong for this "
+                    "model; add it to PRICING in %s.",
+                    self.model, _DEFAULT_PRICING, __name__,
+                )
+        p_in, p_out = prices
         return usage.input_tokens / 1e6 * p_in + usage.output_tokens / 1e6 * p_out
 
     # ── helpers ────────────────────────────────────────────────────────────────

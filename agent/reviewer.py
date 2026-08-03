@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sys
 from pathlib import Path
 
@@ -36,11 +35,11 @@ except ImportError:
     pass
 
 try:
-    from .providers import ProviderError, Usage, get_provider
+    from .providers import ProviderError, Usage, get_provider_for_role
     from .schemas import PlannerOutput, ReviewerOutput
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from agent.providers import ProviderError, Usage, get_provider
+    from agent.providers import ProviderError, Usage, get_provider_for_role
     from agent.schemas import PlannerOutput, ReviewerOutput
 
 log = logging.getLogger("agent.reviewer")
@@ -110,41 +109,17 @@ def _accrue(budget, provider, usage) -> None:
 def _get_reviewer_provider():
     """Get the LLM provider for the Reviewer agent.
 
-    Resolution order:
-      1. REVIEWER_PROVIDER + REVIEWER_MODEL (explicit per-agent config)
-      2. PLANNER_PROVIDER + PLANNER_MODEL (shared planner/reviewer config)
-      3. LLM_PROVIDER + LLM_MODEL (global defaults)
+    Resolution lives in agent.providers.resolve_role — REVIEWER_PROVIDER /
+    REVIEWER_MODEL, then LLM_PROVIDER / LLM_MODEL, then a hardcoded default that
+    is never empty.
 
-    The Reviewer typically uses the same quality model as the Planner since
-    review quality matters as much as planning quality.
+    Note this no longer chains through PLANNER_*. Inheriting the Planner's
+    config was surprising (setting one agent silently reconfigured another) and
+    made the three roles behave inconsistently. If you want the Reviewer on the
+    Planner's model, say so explicitly — review quality matters as much as
+    planning quality, so it deserves its own line in .env.
     """
-    reviewer_provider = os.getenv("REVIEWER_PROVIDER", "").strip()
-    reviewer_model = os.getenv("REVIEWER_MODEL", "").strip()
-
-    # If reviewer-specific config exists, use it.
-    if reviewer_provider:
-        kwargs = {}
-        if reviewer_model:
-            kwargs["model"] = reviewer_model
-        return get_provider(name=reviewer_provider, **kwargs)
-
-    # Fall back to planner config, then global config.
-    planner_provider = os.getenv("PLANNER_PROVIDER", "").strip()
-    planner_model = os.getenv("PLANNER_MODEL", "").strip()
-
-    if planner_provider:
-        kwargs = {}
-        if reviewer_model:
-            kwargs["model"] = reviewer_model
-        elif planner_model:
-            kwargs["model"] = planner_model
-        return get_provider(name=planner_provider, **kwargs)
-
-    # Global defaults.
-    kwargs = {}
-    if reviewer_model:
-        kwargs["model"] = reviewer_model
-    return get_provider(**kwargs)
+    return get_provider_for_role("reviewer")
 
 
 # ═════════════════════════════════════════════════════════════════════════════

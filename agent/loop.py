@@ -47,10 +47,14 @@ except ImportError:
     pass  # python-dotenv not installed; user must export vars manually
 
 try:
-    from .providers import ProviderError, ToolCall, ToolSpec, Usage, get_provider
+    from .providers import (
+        ProviderError, ToolCall, ToolSpec, Usage, get_provider, get_provider_for_role,
+    )
 except ImportError:  # executed as a loose script rather than a package module
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from agent.providers import ProviderError, ToolCall, ToolSpec, Usage, get_provider
+    from agent.providers import (
+        ProviderError, ToolCall, ToolSpec, Usage, get_provider, get_provider_for_role,
+    )
 
 
 log = logging.getLogger("agent.loop")
@@ -515,7 +519,10 @@ class ReActAgent:
         self.workspace = Path(workspace).resolve()
         if not self.workspace.is_dir():
             raise ValueError(f"workspace is not a directory: {self.workspace}")
-        self.provider = provider or get_provider()
+        # The Coder is a role like any other: CODER_PROVIDER / CODER_MODEL, then
+        # LLM_*, then a non-empty default. This is the loop that spends most of
+        # the tokens, so it is usually the one to run cheap.
+        self.provider = provider or get_provider_for_role("coder")
         self.budget = budget or Budget()
         self.system = system or DEFAULT_SYSTEM
         self.max_output_tokens = max_output_tokens

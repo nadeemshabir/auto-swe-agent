@@ -44,7 +44,7 @@ log = logging.getLogger("app.main")
 
 # ── configuration ────────────────────────────────────────────────────────────
 
-GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "")
+GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET", "").strip()
 MAX_WEBHOOK_BODY_BYTES = int(os.getenv("MAX_WEBHOOK_BODY_BYTES", "1048576"))  # 1 MB
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
@@ -69,6 +69,30 @@ RUNS_RATE_LIMIT = int(os.getenv("RUNS_RATE_LIMIT", "10"))
 RUNS_RATE_WINDOW_S = int(os.getenv("RUNS_RATE_WINDOW_S", "60"))
 _rate_buckets: dict[str, list[float]] = {}
 
+
+def _envflag(name: str, default: str = "false") -> bool:
+    return (os.getenv(name, default) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Whether webhook-triggered runs execute tests inside the hardened sandbox
+# (agent/sandbox.py) instead of host-side in the worker container.
+#
+# OFF by default, and it is a config flip rather than a code change on purpose
+# (plan2.md §10, D10): the sandbox needs a real Docker daemon on the host, which
+# container platforms — Azure Container Apps, ACI, App Service — do not provide.
+# So this stays false while deployed on a container platform, and becomes true
+# when the workload moves somewhere with a daemon (a VM, AKS with socket access,
+# or locally).
+#
+# Setting it true without a reachable daemon does NOT silently degrade: the
+# orchestrator ends the run as `sandbox_error` (workers/tasks.py step 7), so a
+# misconfiguration is loud rather than quietly running untrusted code unguarded.
+#
+# ⚠️ Before turning this on, the sandbox image must contain the TARGET repo's
+# test dependencies — it has no network, and runs a bare `python -m pytest`
+# against the image's own site-packages. See DECISION D9.
+USE_SANDBOX = _envflag("USE_SANDBOX")
+
 # ── FastAPI app ──────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -84,7 +108,9 @@ class ManualRunRequest(BaseModel):
     """Body for POST /runs — manual trigger."""
     repo: str
     issue_number: int
-    use_sandbox: bool = False
+    # None = follow the USE_SANDBOX default; true/false overrides it for this
+    # one run, which is how you smoke-test the sandbox without changing config.
+    use_sandbox: bool | None = None
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -272,7 +298,7 @@ async def webhook_github(
 
     # ── 5. Enqueue the task ──────────────────────────────────────────────
     from workers.tasks import run_issue
-    async_result = _enqueue_run(run_issue, issue.repo, issue.number)
+    async_result = _enqueue_run(run_issue, issue.repo, issue.number, USE_SANDBOX)
 
     # Record enqueued event in DB
     try:
@@ -330,8 +356,11 @@ async def manual_trigger(
     _check_repo_allowed(req.repo)
     _check_rate_limit(request.client.host if request.client else "unknown")
 
+    # An explicit value in the body wins; otherwise follow the deployment default.
+    use_sandbox = USE_SANDBOX if req.use_sandbox is None else req.use_sandbox
+
     from workers.tasks import run_issue
-    async_result = _enqueue_run(run_issue, req.repo, req.issue_number, req.use_sandbox)
+    async_result = _enqueue_run(run_issue, req.repo, req.issue_number, use_sandbox)
 
     # Record the manual run request as a special webhook event for audit
     from db.session import get_session
@@ -546,7 +575,15 @@ async def readyz():
         errors["db"] = str(e)
 
     if redis_ok and db_ok:
-        return {"status": "ready", "redis": "ok", "db": "ok"}
+        # `sandbox` is echoed so you can confirm the deployed configuration from
+        # outside the box — "did USE_SANDBOX actually take effect" is otherwise
+        # only answerable by SSH-ing in and reading the environment.
+        return {
+            "status": "ready",
+            "redis": "ok",
+            "db": "ok",
+            "sandbox": "on" if USE_SANDBOX else "off",
+        }
     else:
         return JSONResponse(
             status_code=503,
@@ -622,12 +659,17 @@ def _selftest() -> int:
 
     # Patch the webhook secret and API token for testing.
     global GITHUB_WEBHOOK_SECRET, MAX_WEBHOOK_BODY_BYTES
-    global AGENT_API_TOKEN, AGENT_REPO_ALLOWLIST, RUNS_RATE_LIMIT
+    global AGENT_API_TOKEN, AGENT_REPO_ALLOWLIST, RUNS_RATE_LIMIT, USE_SANDBOX
     original_secret = GITHUB_WEBHOOK_SECRET
     original_api_token = AGENT_API_TOKEN
+    original_allowlist = AGENT_REPO_ALLOWLIST
     GITHUB_WEBHOOK_SECRET = secret
     api_token = "test-agent-token-abcdef"
     AGENT_API_TOKEN = api_token
+    # Pin every security setting the tests depend on, so the suite does not
+    # change behaviour with the ambient .env. A real AGENT_REPO_ALLOWLIST would
+    # otherwise reject this test's fixed "octo/test" payload.
+    AGENT_REPO_ALLOWLIST = set()
 
     # Patch run_issue.delay to capture calls without Redis.
     enqueued: list[dict] = []
@@ -749,8 +791,36 @@ def _selftest() -> int:
         check("manual trigger run_id == task_id",
               r.json()["run_id"] == enqueued[2]["task_id"])
 
+        # ── sandbox flag: config flip, not a code change (D10) ───────────
+        # NOTE: assign the module global directly. `python -m app.main` runs this
+        # file as __main__, so `import app.main` would bind a SECOND copy of the
+        # module and mutating that one leaves the app under test unchanged.
+        print("USE_SANDBOX flag")
+        sandbox_orig = USE_SANDBOX
+
+        USE_SANDBOX = False
+        client.post("/runs", json=body, headers=auth)
+        check("default: run has sandbox off",
+              enqueued[-1]["args"][2] is False, str(enqueued[-1]["args"]))
+
+        client.post("/runs", json={**body, "use_sandbox": True}, headers=auth)
+        check("explicit true in body overrides the default",
+              enqueued[-1]["args"][2] is True, str(enqueued[-1]["args"]))
+
+        USE_SANDBOX = True
+        try:
+            client.post("/runs", json=body, headers=auth)
+            check("USE_SANDBOX=true becomes the default",
+                  enqueued[-1]["args"][2] is True, str(enqueued[-1]["args"]))
+            client.post("/runs", json={**body, "use_sandbox": False}, headers=auth)
+            check("explicit false in body still overrides",
+                  enqueued[-1]["args"][2] is False, str(enqueued[-1]["args"]))
+        finally:
+            USE_SANDBOX = sandbox_orig
+        check("readyz reports the sandbox mode",
+              client.get("/readyz").json().get("sandbox") in ("on", "off"))
+
         # ── manual trigger: repo allowlist ───────────────────────────────
-        original_allowlist = AGENT_REPO_ALLOWLIST
         AGENT_REPO_ALLOWLIST = {"only/this"}
         try:
             r = client.post("/runs", json=body, headers=auth)
@@ -759,7 +829,7 @@ def _selftest() -> int:
                             headers=auth)
             check("allowlisted repo → 202", r.status_code == 202, f"got {r.status_code}")
         finally:
-            AGENT_REPO_ALLOWLIST = original_allowlist
+            AGENT_REPO_ALLOWLIST = set()
 
         # ── manual trigger: rate limit ───────────────────────────────────
         original_limit = RUNS_RATE_LIMIT
@@ -839,6 +909,7 @@ def _selftest() -> int:
         # Restore originals.
         GITHUB_WEBHOOK_SECRET = original_secret
         AGENT_API_TOKEN = original_api_token
+        AGENT_REPO_ALLOWLIST = original_allowlist
         _rate_buckets.clear()
         workers.tasks.run_issue.apply_async = original_apply_async
         reset_singletons()
