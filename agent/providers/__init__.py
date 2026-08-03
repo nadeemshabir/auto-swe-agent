@@ -78,6 +78,19 @@ DEFAULT_MODELS: dict[str, str] = {
     "gemini": "gemini-3.5-flash",
 }
 
+# A stable, high-availability model per provider, used when the configured one
+# fails. It must be a NON-PREVIEW model: preview models are capacity-limited
+# (503 "experiencing high demand") and change behaviour without notice, which is
+# exactly what a fallback must not do.
+#
+# Override with LLM_FALLBACK_MODEL when the configured provider needs something
+# different. A fallback is only attempted when it differs from the model that
+# just failed — otherwise it would just repeat the same call.
+FALLBACK_MODELS: dict[str, str] = {
+    "anthropic": "claude-opus-4-8",
+    "gemini": "gemini-3.5-flash",
+}
+
 ROLES = ("planner", "coder", "reviewer")
 
 
@@ -143,6 +156,35 @@ def resolve_role(role: str) -> tuple[str, str]:
             )
 
     return provider, model
+
+
+def get_fallback_for_role(role: str) -> LLMProvider | None:
+    """A provider on the fallback model for `role`, or None if there isn't one.
+
+    Returns None when the role is already configured to use the fallback model —
+    retrying the identical call would just fail the same way.
+
+    This exists because a configured model can be *reachable but unusable*: a
+    preview model returning 503 under load, or one whose output the caller
+    cannot parse. Both leave the pipeline running with no plan rather than
+    failing outright, which is worse than switching to a duller model that
+    works (plan2.md §22 F24).
+    """
+    try:
+        provider, model = resolve_role(role)
+    except ProviderError:
+        return None
+
+    fallback = _env("LLM_FALLBACK_MODEL") or FALLBACK_MODELS.get(provider, "")
+    if not fallback or fallback == model:
+        return None
+
+    log.warning("%s: falling back from %r to %r", role, model, fallback)
+    try:
+        return get_provider(name=provider, model=fallback)
+    except ProviderError as e:
+        log.error("%s: fallback provider could not be built: %s", role, e)
+        return None
 
 
 def get_provider_for_role(role: str, **kwargs) -> LLMProvider:

@@ -39,11 +39,15 @@ except ImportError:
     pass
 
 try:
-    from .providers import ProviderError, Usage, get_provider_for_role
+    from .providers import (
+        ProviderError, Usage, get_fallback_for_role, get_provider_for_role,
+    )
     from .schemas import PlannerOutput
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from agent.providers import ProviderError, Usage, get_provider_for_role
+    from agent.providers import (
+        ProviderError, Usage, get_fallback_for_role, get_provider_for_role,
+    )
     from agent.schemas import PlannerOutput
 
 log = logging.getLogger("agent.planner")
@@ -169,6 +173,7 @@ def run_planner(
     max_tokens: int = 2048,
     skip_retrieval: bool = False,
     budget=None,
+    fallback_provider=None,
 ) -> tuple[PlannerOutput, Usage]:
     """Run the Planner agent.
 
@@ -193,12 +198,17 @@ def run_planner(
     budget : Budget, optional
         Shared run budget. When given, every Planner model call is accrued into
         it so Planner spend counts toward the run's caps (plan2.md §22 F4).
+    fallback_provider : LLMProvider, optional
+        Model to retry on when the configured one yields no usable plan. If
+        omitted, one is resolved from FALLBACK_MODELS — but ONLY when `provider`
+        was not supplied by the caller (§22 F24).
 
     Returns
     -------
     tuple[PlannerOutput, Usage]
         The structured plan and the token usage for budget tracking.
     """
+    caller_supplied_provider = provider is not None
     provider = provider or _get_planner_provider()
 
     # Retrieve codebase context (unless skipped).
@@ -214,58 +224,88 @@ def run_planner(
         parts.append(f"\n\n--- RELEVANT CODE FROM THE REPOSITORY ---\n{code_context}")
     user_text = "\n".join(parts)
 
-    # First attempt.
-    messages = [provider.user_message(user_text)]
     total_usage = Usage()
 
-    try:
-        resp = provider.complete(
-            system=PLANNER_SYSTEM,
-            messages=messages,
-            tools=[],  # Planner doesn't use tools
-            max_tokens=max_tokens,
-        )
-    except ProviderError as e:
-        log.error("planner: provider error on first attempt: %s", e)
-        return PlannerOutput(understanding=f"Planner failed: {e}"), Usage()
-
-    total_usage = total_usage + resp.usage
-    _accrue(budget, provider, resp.usage)
-    plan = PlannerOutput.from_llm_text(resp.text)
-
-    # If parsing got structured steps, we have a real plan — done.
-    # (When JSON parsing fails, from_llm_text() puts raw text in understanding
-    # but leaves plan_steps empty.  We want to retry in that case.)
-    if plan.plan_steps:
-        log.info("planner: produced plan with %d steps, %d files",
-                 len(plan.plan_steps), len(plan.files_to_touch))
-        return plan, total_usage
-
-    # Retry with a nudge.
-    log.warning("planner: first attempt produced empty/unparseable output, retrying")
-    try:
-        messages.append(provider.assistant_turn(resp))
-        messages.append(provider.user_message(RETRY_NUDGE))
-        resp2 = provider.complete(
-            system=PLANNER_SYSTEM,
-            messages=messages,
-            tools=[],
-            max_tokens=max_tokens,
-        )
-        total_usage = total_usage + resp2.usage
-        _accrue(budget, provider, resp2.usage)
-        plan = PlannerOutput.from_llm_text(resp2.text)
-    except ProviderError as e:
-        log.error("planner: provider error on retry: %s", e)
-        # Use whatever we got from the first attempt.
+    # Attempt with the configured model, then — if that produced no usable plan
+    # — once more on the fallback model. A model can be reachable but unusable:
+    # overloaded (503), or emitting output the parser cannot use. Both used to
+    # leave the Coder running with no plan_steps, no files_to_touch and no
+    # test_strategy, which is worse than a duller model that answers cleanly
+    # (plan2.md §22 F24).
+    plan, usage, raw = _attempt(provider, user_text, max_tokens, budget, "configured")
+    total_usage = total_usage + usage
 
     if not plan.plan_steps:
-        log.warning("planner: retry also produced empty output; using raw text as understanding")
-        plan = PlannerOutput(understanding=(resp.text or "No plan generated.").strip()[:2000])
+        # Only auto-resolve a fallback when WE chose the provider. An explicit
+        # provider= means the caller wants that one specifically — silently
+        # reaching for a different model would surprise them, and would make
+        # offline tests fire real API calls the moment a key is in .env.
+        fallback = fallback_provider
+        if fallback is None and not caller_supplied_provider:
+            fallback = get_fallback_for_role("planner")
+        if fallback is not None:
+            log.warning("planner: configured model produced no usable plan — "
+                        "retrying on the fallback model")
+            fb_plan, fb_usage, fb_raw = _attempt(
+                fallback, user_text, max_tokens, budget, "fallback")
+            total_usage = total_usage + fb_usage
+            if fb_plan.plan_steps:
+                plan, raw = fb_plan, fb_raw
+            elif not plan.understanding:
+                plan, raw = fb_plan, fb_raw
+
+    if not plan.plan_steps:
+        log.warning("planner: no model produced a parseable plan; "
+                    "using raw text as understanding")
+        plan = PlannerOutput(understanding=(raw or "No plan generated.").strip()[:2000])
 
     log.info("planner: produced plan with %d steps, %d files",
              len(plan.plan_steps), len(plan.files_to_touch))
     return plan, total_usage
+
+
+def _attempt(provider, user_text: str, max_tokens: int, budget,
+             label: str) -> tuple[PlannerOutput, Usage, str]:
+    """One model's shot at producing a plan: initial call, then a reparse nudge.
+
+    Returns (plan, usage, raw_text). `plan.plan_steps` being empty means this
+    model did not produce anything usable — the caller decides whether to try
+    another one.
+    """
+    model = getattr(provider, "model", "?")
+    messages = [provider.user_message(user_text)]
+    usage = Usage()
+
+    try:
+        resp = provider.complete(system=PLANNER_SYSTEM, messages=messages,
+                                 tools=[], max_tokens=max_tokens)
+    except ProviderError as e:
+        log.error("planner[%s/%s]: provider error: %s", label, model, e)
+        return PlannerOutput(), usage, ""
+
+    usage = usage + resp.usage
+    _accrue(budget, provider, resp.usage)
+    plan = PlannerOutput.from_llm_text(resp.text)
+    if plan.plan_steps:
+        return plan, usage, resp.text
+
+    # Unparseable — nudge once for raw JSON before giving up on this model.
+    log.warning("planner[%s/%s]: unparseable output, nudging for raw JSON",
+                label, model)
+    try:
+        messages.append(provider.assistant_turn(resp))
+        messages.append(provider.user_message(RETRY_NUDGE))
+        resp2 = provider.complete(system=PLANNER_SYSTEM, messages=messages,
+                                  tools=[], max_tokens=max_tokens)
+        usage = usage + resp2.usage
+        _accrue(budget, provider, resp2.usage)
+        plan2 = PlannerOutput.from_llm_text(resp2.text)
+        if plan2.plan_steps:
+            return plan2, usage, resp2.text
+    except ProviderError as e:
+        log.error("planner[%s/%s]: provider error on nudge: %s", label, model, e)
+
+    return plan, usage, resp.text
 
 
 # ═════════════════════════════════════════════════════════════════════════════

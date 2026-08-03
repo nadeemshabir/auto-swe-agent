@@ -206,3 +206,98 @@ def test_planner_falls_back_visibly_when_given_thinking_text():
     assert plan.plan_steps == []                   # ...and nothing else populated
     assert plan.files_to_touch == []
     assert plan.is_empty() is False                # has text, so not "empty"
+
+
+# ── fallback model when the configured one is unusable (§22 F24) ─────────────
+
+class _Resp:
+    def __init__(self, text):
+        from agent.providers import Usage
+        self.text, self.tool_calls, self.stop_reason = text, [], "end_turn"
+        self.usage, self.raw = Usage(100, 50), None
+
+
+class _Prov:
+    name = "mock"
+
+    def __init__(self, model, texts):
+        self.model, self._texts, self.calls = model, list(texts), 0
+
+    def complete(self, **kw):
+        t = self._texts[min(self.calls, len(self._texts) - 1)]
+        self.calls += 1
+        if isinstance(t, Exception):
+            raise t
+        return _Resp(t)
+
+    def user_message(self, text):
+        return {"role": "user", "content": text}
+
+    def assistant_turn(self, r):
+        return {"role": "assistant", "content": r.text}
+
+    def tool_result_message(self, results):
+        return {"role": "user", "content": "r"}
+
+    def count_tokens(self, **kw):
+        return 10
+
+    def cost_usd(self, u):
+        return 0.001
+
+
+GOOD_JSON = ('{"understanding":"u","root_cause_hypothesis":"r",'
+             '"files_to_touch":["a.py"],"plan_steps":["s1"],'
+             '"test_strategy":"t","risk_notes":"n"}')
+
+
+def test_planner_falls_back_when_configured_model_emits_garbage(tmp_path):
+    """F24: a reasoning model that never returns JSON left the Coder with no
+    plan at all. A duller model that answers cleanly is far better."""
+    from agent.planner import run_planner
+
+    primary = _Prov("preview-model", ["thinking out loud...", "still thinking..."])
+    backup = _Prov("stable-model", [GOOD_JSON])
+
+    plan, usage = run_planner("Fix it.", tmp_path, provider=primary,
+                              fallback_provider=backup, skip_retrieval=True)
+
+    assert plan.plan_steps == ["s1"], "fallback model's plan was not used"
+    assert plan.files_to_touch == ["a.py"]
+    assert primary.calls == 2, "primary should get its nudge before giving up"
+    assert backup.calls == 1
+    assert usage.input_tokens == 300, "usage from both models must be counted"
+
+
+def test_planner_falls_back_when_configured_model_errors(tmp_path):
+    """The 503-overloaded case: the model is reachable but unusable."""
+    from agent.planner import run_planner
+    from agent.providers import ProviderError
+
+    primary = _Prov("preview-model", [ProviderError("503 UNAVAILABLE")])
+    backup = _Prov("stable-model", [GOOD_JSON])
+
+    plan, _ = run_planner("Fix it.", tmp_path, provider=primary,
+                          fallback_provider=backup, skip_retrieval=True)
+    assert plan.plan_steps == ["s1"]
+
+
+def test_planner_does_not_fall_back_when_primary_succeeds(tmp_path):
+    """The fallback must not cost a second call on the happy path."""
+    from agent.planner import run_planner
+
+    primary = _Prov("good-model", [GOOD_JSON])
+    backup = _Prov("stable-model", [GOOD_JSON])
+
+    plan, _ = run_planner("Fix it.", tmp_path, provider=primary,
+                          fallback_provider=backup, skip_retrieval=True)
+    assert plan.plan_steps == ["s1"]
+    assert backup.calls == 0, "fallback was called despite the primary working"
+
+
+def test_no_fallback_when_it_would_be_the_same_model(monkeypatch):
+    """Retrying the identical call would just fail the same way."""
+    from agent.providers import FALLBACK_MODELS, get_fallback_for_role
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    monkeypatch.setenv("PLANNER_MODEL", FALLBACK_MODELS["gemini"])
+    assert get_fallback_for_role("planner") is None
