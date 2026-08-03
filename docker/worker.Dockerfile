@@ -74,19 +74,16 @@ COPY requirements.txt .
 # project uses a GPU: the only model that runs locally is the MiniLM embedder
 # (agent/retrieval.py), on CPU, and the LLMs are all remote API calls.
 #
-# Left unpinned it took the worker image to 9.74 GB — 3.19 GB with this fix.
-# Keep this above the requirements install.
+# Applies to EVERY architecture, x86 and arm64 alike. PyPI publishes CUDA
+# builds of torch for aarch64 as well (for Grace/GH200-class ARM servers), so
+# an ARM host is not automatically CPU-only — measured on this project's arm64
+# image: torch 2.13.0+cu130 with 2.9 GB of nvidia-* and 652 MB of triton, for a
+# 9.75 GB image. The CPU index carries a 148 MB aarch64 wheel.
 #
-# x86 only: PyTorch's CPU index does not reliably carry aarch64 wheels, and it
-# does not need to — the ARM Linux torch on PyPI is CPU-only already, since the
-# nvidia-* CUDA packages are published for x86 alone. So on ARM we let
-# requirements.txt resolve torch normally and get the same result.
-RUN if [ "$(uname -m)" = "x86_64" ]; then \
-        pip install --no-cache-dir \
-            --index-url https://download.pytorch.org/whl/cpu torch; \
-    else \
-        echo "non-x86 ($(uname -m)): PyPI torch is already CPU-only here, skipping"; \
-    fi
+# Left unpinned the worker image is 9.7 GB; with this it is ~3 GB.
+RUN pip install --no-cache-dir \
+        --index-url https://download.pytorch.org/whl/cpu \
+        torch
 
 RUN pip install --no-cache-dir -r requirements.txt
 

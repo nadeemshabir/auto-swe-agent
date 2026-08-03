@@ -5,8 +5,12 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Environment secrets
+# Environment secrets — cover every variant, not just the bare name.
+# A timestamped .env.bak once slipped past a plain '.env' rule and was
+# only caught by GitHub push protection.
 .env
+.env.*
+*.env
 
 # Generated / runtime data (never commit these)
 .chroma/
