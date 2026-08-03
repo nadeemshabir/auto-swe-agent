@@ -1,6 +1,6 @@
 # Autonomous SWE Agent — Master Plan & Source of Truth
 
-> **Status:** ACTIVE — this is the single source of truth · **Version:** 3.9 · **Date:** 2026-07-31 · **Owner:** Nadeem
+> **Status:** ACTIVE — this is the single source of truth · **Version:** 4.0 · **Date:** 2026-08-03 · **Owner:** Nadeem
 >
 > **This document supersedes `plan.md` (v0.1) and absorbs `newplan.md` (multi-agent
 > design + build order).** v2.0 described a single-loop agent where the backend was
@@ -44,6 +44,7 @@
 | **3.7** | **2026-07-31** | **D20 decided — the last open decision.** Planner and Reviewer on `gemini-3.1-pro-preview`, Coder on `gemini-3.5-flash`; ids taken from the account's live catalogue rather than any document. **F18 found and fixed:** a model missing from `PRICING` was silently costed at the pro rate — the configured `gemini-3.5-flash-lite` was priced at ~22x its real rate, inflating every PR footer and tripping `MAX_USD` far too early. Pricing table filled out and the fallback now warns. |
 | **3.8** | **2026-07-31** | **`[D10]` decided — deploy target changed from Azure Container Apps to a single VM running the existing compose stack.** Container Apps offers no host Docker daemon, so it would have forced the sandbox to be replaced or abandoned; a VM keeps `agent/sandbox.py` running **unchanged**, preserving the §9 threat model and the H1 fix. Residual risk (socket mount = root on host) is recorded in §10 with the conditions that make it acceptable. §21 Phase 2 rewritten; TLS via a reverse proxy is now the one new piece of work. **No decisions remain open.** |
 | **3.9** | **2026-07-31** | **`[D10]` revised — container platform with the sandbox off, behind a flag.** The webhook path was already running `use_sandbox=False`, so the VM was preserving a capability that was not switched on. New `USE_SANDBOX` env var gates it end to end (`POST /runs` can still override per request), so enabling it later is a config change and **not a code change** — the actual requirement. Accepted trade while off: repo tests run in the worker container alongside the tokens, which is why `AGENT_REPO_ALLOWLIST` must stay set. VM analysis retained in §10 for when the sandbox is needed. |
+| **4.0** | **2026-08-03** | **Deployed to production** — Azure VM, live at `auto-swe-nadeem.centralindia.cloudapp.azure.com` with TLS, all five containers healthy, webhook delivering. §21 Phase 2 marked done; **`docs/deployment.md` added** as the operational record (what runs, ten problems hit and what each actually was, how to change things, known gaps). **Four new findings from the deploy itself (F19–F22):** `USE_SANDBOX` never passed through Compose; the CPU-torch fix skipped on arm64 (9.75 GB → 3.03 GB once corrected); a worker healthcheck that could never pass; `.gitignore` missing `.env.*`. ReadMe re-baselined. |
 
 ---
 
@@ -1072,7 +1073,28 @@ what the agent produces. **Do not move to Phase 1 until it resolves issues relia
    to `agent/sandbox.py` is needed, which is the entire point of the choice.
 3. ✅ **Pin `requirements.txt`** (F16) — done in v3.3.
 
-### Phase 2 — First real deployment: a single VM running the existing compose stack
+### ✅ Phase 2 — DONE 2026-08-03: a single VM running the existing compose stack
+
+> **Live at `https://auto-swe-nadeem.centralindia.cloudapp.azure.com`.**
+> Azure VM `auto-swe-vm`, Standard B2pls_v2 (2 vCPU, 4 GB, **arm64**), Central India,
+> Ubuntu 24.04, Docker 29.7.1. Five containers: caddy, api, worker, postgres, redis —
+> all healthy. Let's Encrypt TLS. Auto-shutdown 11:59 PM IST. ~$16/mo VM + ~$5 disk.
+>
+> **`docs/deployment.md` is the operational record** — what runs, the ten problems hit
+> getting there and what each actually was, how to change config/code/schema/repos
+> afterwards, and the known gaps. Read that before touching the deployment; this
+> section is the rationale only.
+>
+> Verified in production rather than assumed: all four Alembic revisions applied to real
+> Postgres — including `c4d1e88a5f27`, whose **PostgreSQL branch had only ever been
+> tested against SQLite** — and the resulting partial index was inspected directly.
+> `/readyz` returns `sandbox: off`, confirming `USE_SANDBOX` is read through Compose.
+> GitHub webhook #660604062 reports `204 OK`.
+>
+> **Deliberately not used:** Azure Container Registry (the VM builds its own images) and
+> Azure Database for PostgreSQL (Postgres runs in the compose stack) — both created
+> during the abandoned Container Apps attempt and since deleted. Together they were
+> costing more than the VM.
 
 **Why a VM and not a PaaS.** This was reconsidered on 2026-07-31 and the answer changed.
 The earlier plan targeted Azure Container Apps, which offers no host Docker socket — so
@@ -1164,7 +1186,7 @@ reviewed without seeing the new files, and the accounting didn't add up — so t
 multi-agent split was paying three models' worth of cost for roughly one model's worth
 of signal.
 
-**Status as of v3.4:** ✅ **all 16 findings closed**, every one covered by a test that
+**Status as of v4.0:** ✅ **all 22 findings closed**, every one covered by a test that
 was confirmed to fail against the pre-fix code. Nothing in this audit blocks §21 Phase 0.
 What remains is decisions, not defects — see §25.
 
@@ -1359,6 +1381,44 @@ model change cannot reintroduce this silently.
 **Caveat:** the rates themselves still cannot be verified programmatically; the API
 exposes ids and token limits, not prices. Check them against the pricing page before
 relying on `MAX_USD`.
+
+### 🟠 Added 2026-08-03 — found while deploying to the VM
+
+*Four defects that only surfaced against real infrastructure. None was reachable by
+local testing, which is the point worth remembering: the deployment was itself a test,
+and it found things fifty passing tests did not.*
+
+**F19 — `USE_SANDBOX` was not passed through Compose.** ✅ **FIXED**
+The flag existed in `.env` and was read by `app/main.py`, but `docker-compose.yml`
+never forwarded it into the containers. Setting it would have appeared to work and
+silently done nothing — the worst kind of config bug, since the failure is invisible.
+**Fix:** added to the `x-agent-env` block. `/readyz` now echoes `sandbox: on|off` so
+the effective value is verifiable from outside the host.
+
+**F20 — The CPU-only torch fix was skipped on arm64.** ✅ **FIXED**
+The fix that took the worker image from 9.74 GB to 3.19 GB on x86 was guarded to x86
+only, on the reasoning that ARM Linux torch is CPU-only anyway. That is outdated: PyPI
+publishes CUDA builds for aarch64 (Grace/GH200-class servers). The ARM build produced
+`torch 2.13.0+cu130` with 2.9 GB of nvidia-* and 652 MB of triton — **9.75 GB**, the
+exact problem the fix existed to prevent.
+**Fix:** guard removed after testing rather than reasoning — `pip download` against the
+CPU index on the ARM host returned a 148 MB aarch64 wheel. **9.75 GB → 3.03 GB.**
+
+**F21 — The worker healthcheck could never pass.** ✅ **FIXED**
+`docker/worker.Dockerfile` pinged `celery@$$HOSTNAME`. In `sh`, `$$` is the shell's
+PID, so it resolved to `celery@131HOSTNAME` — a node that has never existed. The
+container reported `unhealthy` permanently while the worker was connected to the broker
+and consuming tasks normally. It had been failing since the line was written.
+**Fix:** dropped `--destination`; `inspect ping` broadcasts and any pong answers the
+real question. Confirmed against the deployed container: old form FAIL, new form PASS.
+*A healthcheck that can only fail is worse than none — it teaches you to ignore
+container status, so the day the worker really dies you will not notice.*
+
+**F22 — `.gitignore` covered `.env` but not `.env.bak.*`.** ✅ **FIXED**
+A timestamped backup created before editing `.env` was swept in by `git add -A` and
+only stopped by GitHub push protection. Nothing leaked.
+**Fix:** `.gitignore` now covers `.env`, `.env.*` and `*.env`, verified against
+`.env.bak.123`, `.env.local` and `prod.env`.
 
 ### 🟡 Medium — correctness, quality, and hygiene
 

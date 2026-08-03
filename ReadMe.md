@@ -19,8 +19,8 @@ This project covers the full stack of an agentic AI system:
 - ReAct reasoning loop (multi-step Reason → Act → Observe)
 - Sandboxed code execution (Docker SDK, network isolation, filesystem constraints, timeouts)
 - Backend orchestration (FastAPI, Celery, Redis, PostgreSQL)
-- Full observability (Prometheus metrics, Grafana dashboards, OpenTelemetry tracing)
-- Production deployment (Kubernetes, Helm, CI/CD with GitHub Actions)
+- Durable observability (per-agent step traces queryable over HTTP)
+- Production deployment (Docker Compose on a cloud VM, TLS, secrets, cost controls)
 
 ## System Architecture
 
@@ -123,38 +123,81 @@ sequenceDiagram
 
 ## Status
 
+**Live in production** on an Azure VM since 2026-08-03 — see
+[docs/deployment.md](docs/deployment.md).
+
 By component:
 
-- **Environment setup:** Done ✅
-- **Codebase understanding** (`agent/retrieval.py`): Done ✅ — tree-sitter chunking, embeddings, ChromaDB, call graph, token-budgeted context
-- **ReAct reasoning loop** (`agent/loop.py` + `agent/providers/`): Done ✅ — multi-step loop, budget controller, sandboxed tools, pluggable Anthropic/Gemini (`gemini-3.5-flash`) providers
-- **GitHub integration** (`agent/github.py`): Done ✅ — REST client with rate-limiting backoff, HMAC signature verification, idempotent PR creation, webhook event ingestion
-- **Docker sandbox** (`agent/sandbox.py`): Done ✅ — hardened per-run container (`--network none`, read-only host FS, resource caps, pytest integration)
-- **Backend & queue** (`app/`, `workers/`, `db/`): Done ✅ — FastAPI web gateway, Celery distributed task queue, Redis broker, PostgreSQL database state tracking with Alembic migrations
-- **Docker Compose & Webhook Tunneling:** Done ✅ — full multi-container local production environment exposed via ngrok for automated end-to-end GitHub issue processing
-- **Observability & cloud deployment** (`monitoring/`, `k8s/`, `helm/`): In progress ⏳ (Phase 1-2 cloud deployment roadmap established)
+- **Codebase understanding** (`agent/retrieval.py`): Done ✅ — tree-sitter chunking, embeddings, in-memory ChromaDB, call graph, token-budgeted context
+- **Multi-agent reasoning** (`agent/planner.py`, `agent/loop.py`, `agent/reviewer.py`): Done ✅ — Planner → Coder (ReAct) → Reviewer, one shared token/USD budget across all three, per-role model selection
+- **GitHub integration** (`agent/github.py`): Done ✅ — REST client with rate-limiting backoff, HMAC verification, idempotent PR creation, hardened git helpers
+- **Docker sandbox** (`agent/sandbox.py`): Built ✅, **off in deployment** — `USE_SANDBOX=false`; a config flip, not a code change (see [docs/deployment.md](docs/deployment.md) §2)
+- **Backend & queue** (`app/`, `workers/`, `db/`): Done ✅ — FastAPI gateway, Celery, Redis broker, PostgreSQL with Alembic migrations, append-only run history
+- **Security**: Done ✅ — HMAC webhooks, authenticated `POST /runs` (fail-closed), repo allowlist, rate limiting, TLS via Caddy
+- **Cloud deployment**: Done ✅ — single Azure VM running the same Compose stack, Let's Encrypt TLS, auto-shutdown for cost control
+- **Tests**: 50 integration tests + 9 module self-tests, all offline and API-key-free
+- **Observability** (`monitoring/`): Not started ⏳ — the `/runs/{id}/steps` trace endpoint covers most of the need today
+
+### Testing
+
+```bash
+python -m pytest tests/ -v    # 50 integration tests, no API key needed
+python -m agent.loop          # per-module self-tests (also: planner, reviewer,
+                              # github, sandbox, schemas, db.models, workers.tasks, app.main)
+```
+
+Every test was confirmed to **fail** against the pre-fix code before being
+accepted — a test that passes either way proves nothing.
 
 ## Quick Start (Docker Compose & Webhooks)
 
 ```bash
 # 1. Clone & create environment file
 cp .env.example .env
-# Edit .env and set GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET, and GEMINI_API_KEY / ANTHROPIC_API_KEY
+# Set GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET, GEMINI_API_KEY / ANTHROPIC_API_KEY,
+# AGENT_API_TOKEN, and AGENT_REPO_ALLOWLIST
 
-# 2. Start the multi-container stack (API, Worker, Redis, Postgres, DB Migrations)
-docker-compose up --build
+# 2. Start the stack (API, Worker, Redis, Postgres, migrations)
+docker compose up --build -d
+curl localhost:8000/readyz          # {"status":"ready", ... ,"sandbox":"off"}
 
-# 3. Expose local API gateway to GitHub via ngrok
+# 3. Expose the gateway to GitHub
 ngrok http 8000
 
-# 4. Add Webhook to your GitHub Repo
-# Payload URL: https://<your-ngrok-domain>.ngrok-free.dev/webhooks/github
-# Content type: application/json
-# Secret: <your GITHUB_WEBHOOK_SECRET>
-# Events: Issues
+# 4. Register the webhook — one command, no clicking through repo settings
+bash scripts/setup_webhook.sh --repo owner/name --url https://<id>.ngrok-free.app
+bash scripts/setup_webhook.sh --repo owner/name --ping     # expect 204
 
-# 5. Open an issue on GitHub — the agent will autonomously solve it and submit a PR!
+# 5. Open an issue — the agent solves it and opens a PR
 ```
+
+`setup_webhook.sh` is idempotent **by webhook path**, so re-running it after an
+ngrok restart updates the existing hook instead of piling up dead ones. It also
+supports `--list`, `--ping` and `--delete`.
+
+### Configuration that matters
+
+Each agent can use its own provider and model. Resolution is role-specific vars →
+`LLM_*` → a hardcoded default that **can never be empty**:
+
+```bash
+PLANNER_MODEL=gemini-3.1-pro-preview     # one call per run — plan quality sets everything downstream
+CODER_MODEL=gemini-3.5-flash             # the ReAct loop; dominates token spend, so run it cheap
+REVIEWER_MODEL=gemini-3.1-pro-preview    # one call per run — catching what the Coder missed
+```
+
+A model id is provider-specific and is never inherited across providers: setting
+`PLANNER_PROVIDER=anthropic` while `LLM_PROVIDER=gemini` falls through to the
+Anthropic default rather than handing a Gemini model name to the Anthropic API.
+
+```bash
+USE_SANDBOX=false            # run tests in the hardened container (needs a Docker daemon)
+AGENT_REPO_ALLOWLIST=...     # repos the agent may touch — enforced on webhook AND POST /runs
+MAX_USD=5.0                  # per-run spend cap, across all three agents
+```
+
+⚠️ These are read **once at process start**. After editing `.env`:
+`docker compose up -d --force-recreate api worker`.
 
 ### Manual CLI Usage
 
@@ -171,27 +214,36 @@ The model and effort are configurable via env vars (`LLM_PROVIDER`, `LLM_MODEL`,
 
 ## Development
 
-The `docs/` folder has deep-dives on each component built so far:
+The `docs/` folder has deep-dives on each component:
 
+- [docs/deployment.md](docs/deployment.md) — **how it's deployed, what broke getting there, and how to change it**
 - [docs/retrieval.md](docs/retrieval.md) — the codebase understanding engine
 - [docs/loop.md](docs/loop.md) — the ReAct agent loop and tools
 - [docs/github.md](docs/github.md) — GitHub integration: issue intake, PR output, git helpers
 - [docs/sandbox.md](docs/sandbox.md) — the hardened Docker execution sandbox
 - [docs/llm-provider-abstraction.md](docs/llm-provider-abstraction.md) — ADR: pluggable Anthropic/Gemini providers
 
+[plan2.md](plan2.md) is the single source of truth for architecture, decisions
+and open work — including §22, an audit that found 18 defects in the
+multi-agent integration and how each was fixed.
+
 Core tech stack:
 
 - Python 3.12
-- LLM: pluggable — Anthropic Claude **or** Google Gemini (see [docs/llm-provider-abstraction.md](docs/llm-provider-abstraction.md))
-- Docker + Kubernetes 
-- FastAPI + Celery
-- Prometheus + Grafana
-- GitHub Actions CI/CD
+- LLM: pluggable — Anthropic Claude **or** Google Gemini, selectable per agent role
+- Docker + Docker Compose
+- FastAPI + Celery + Redis + PostgreSQL
+- Caddy (TLS), Azure VM
+- tree-sitter, sentence-transformers, ChromaDB
 
-The reasoning core is not hard-wired to one vendor. The ReAct loop talks to an
-`LLMProvider` interface, and a thin adapter selects Anthropic or Gemini at
-runtime via the `LLM_PROVIDER` env var (default `anthropic`, model
-`claude-opus-4-8`). See the ADR linked above for the contract and rationale.
+The reasoning core is not hard-wired to one vendor. All three agents talk to an
+`LLMProvider` interface, and `resolve_role()` picks the provider and model per
+role at runtime. See the ADR linked above for the contract and rationale.
+
+Kubernetes/Helm and Prometheus/Grafana were in the original design and are
+deliberately **not** built — see `plan2.md` §N5 and §21. A single VM is a
+complete deployment for this workload, and the `/runs/{id}/steps` trace endpoint
+covers most of what dashboards would.
 
 ## About the Author
 
