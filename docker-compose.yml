@@ -181,7 +181,11 @@ services:
       <<: *agent-env
     ports:
       # The public port GitHub webhooks point to.
-      - "8000:8000"
+      # Bound to loopback deliberately. Locally you still reach it at
+      # localhost:8000 (and ngrok connects to it the same way). In a cloud
+      # deployment the only route in is the TLS reverse proxy, so the API is
+      # never directly exposed even if a firewall rule is later loosened.
+      - "127.0.0.1:8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
