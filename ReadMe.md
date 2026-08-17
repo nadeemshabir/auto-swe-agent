@@ -1,39 +1,84 @@
 # Autonomous SWE Agent
 
-An AI system that autonomously reads GitHub issues, writes code to fix them, tests the code, and opens Pull Requests. Built over 8 weeks as an advanced AI engineering project.
+**Open a GitHub issue. Get a pull request back. No human in the middle.**
 
-## Project Overview
+This is an AI system that watches a repository, reads new issues, figures out
+what the code actually does, writes a fix, runs the tests, and opens a PR
+explaining itself — end to end, unattended.
 
-The goal is to build a production-grade autonomous AI software engineer that:
+It has been live on an Azure VM since 2026-08-03.
 
-1. Watches a GitHub repo for new issues via webhook
-2. Spins up an isolated Docker sandbox 
-3. Uses an LLM to understand the codebase, plan a fix, write code, run tests, and debug failures
-4. Opens a Pull Request with the fix and explanation
-5. Does all of this without any human involvement from issue creation to PR opening
+---
 
-This project covers the full stack of an agentic AI system:
+## The 60-second version
 
-- GitHub integration (webhooks, issues, PRs)
-- Codebase understanding (tree-sitter parsing, sentence-transformers embedding, ChromaDB vector store)
-- ReAct reasoning loop (multi-step Reason → Act → Observe)
-- Sandboxed code execution (Docker SDK, network isolation, filesystem constraints, timeouts)
-- Backend orchestration (FastAPI, Celery, Redis, PostgreSQL)
-- Durable observability (per-agent step traces queryable over HTTP)
-- Production deployment (Docker Compose on a cloud VM, TLS, secrets, cost controls)
+You file an issue:
 
-## System Architecture
+> **Title:** `paginate() drops the last item on the final page`
+> **Body:** When total items is an exact multiple of page_size we get an empty trailing page.
 
-The system has six layers, each independently testable and deployable:
+Roughly 90 seconds later, three things have happened without anyone touching a keyboard:
 
-1. **GitHub Integration** - webhooks, issue parsing, repo cloning, PR creation
-2. **Codebase Understanding** - AST parsing, embedding, vector search, call graph analysis 
-3. **Planning & Reasoning** - Multi-agent design (Planner → Coder ReAct loop → Reviewer) with shared token & monetary budget
-4. **Sandboxed Execution** - isolated Docker containers, network/filesystem constraints 
-5. **Backend & Queue** - FastAPI orchestrator, Celery workers, Redis broker, PostgreSQL store
-6. **Observability & DevOps** - metrics, traces, logs, dashboards, Kubernetes, CI/CD
+1. A comment appears on your issue explaining what the agent thinks is wrong and how it plans to fix it.
+2. A branch `agent/issue-42` is pushed.
+3. A PR opens, with a failing-test-then-passing-test writeup and a diff.
 
-### End-to-End Webhook-to-PR Workflow
+What happened in between:
+
+| Stage | What it does |
+|---|---|
+| **Gateway** | Verifies the webhook's HMAC signature, de-duplicates it, mints a `run_id`, returns `202` immediately |
+| **Worker** | Clones the repo into a throwaway workspace, cuts a branch, indexes every Python file into a vector store |
+| **Planner** | Reads the issue + retrieved code, writes a hypothesis, a step list, and a test strategy |
+| **Coder** | A ReAct loop — search, read, edit, run tests, observe, repeat — until the tests go green |
+| **Reviewer** | Reads the final diff like a senior engineer would and returns approve / request-changes |
+| **Back to Coder** | On request-changes, the feedback goes back into the loop (up to 2 rounds) |
+| **Ship** | Commit, push, open the PR, comment on the issue, tear down the workspace |
+
+Every step of that is written to Postgres as it happens, so you can watch a run
+unfold at `GET /runs/{id}/steps` instead of guessing from logs.
+
+---
+
+## Why this was interesting to build
+
+Most "AI writes code" demos work because the code fits in the prompt. This one
+doesn't get that luxury — it's pointed at real repositories, so nearly every
+hard part is about **what to show the model and what to do when it's wrong**:
+
+- **It can't see the codebase.** So there's a retrieval layer: tree-sitter parses
+  files into semantic chunks (one per function, method, class header, import),
+  a local embedding model turns those into vectors, and a token-budgeted
+  assembler packs the best ones into the prompt.
+- **It runs code it has never seen.** So there's a hardened Docker sandbox —
+  no network, read-only host filesystem, non-root, CPU and wall-clock capped.
+- **It can spend real money.** So one budget object is shared across all three
+  agents. When it's exhausted, the run stops cleanly rather than quietly costing $40.
+- **Providers fall over.** The Planner falls back to a stable model when the
+  configured one is unusable, and the Coder survives a mid-run provider outage
+  instead of losing everything.
+- **Webhooks fire twice.** So delivery IDs are de-duplicated and `(repo, issue_number)`
+  is guarded — GitHub retrying doesn't get you two PRs.
+
+The reasoning core isn't wired to one vendor. All three agents talk to an
+`LLMProvider` interface and you pick provider *and* model per role.
+
+---
+
+## Architecture
+
+Six layers, each testable on its own:
+
+```
+GitHub  ──▶  FastAPI gateway  ──▶  Redis/Celery  ──▶  Planner ─▶ Coder ─▶ Reviewer
+                    │                                     │
+                    ▼                                     ▼
+               PostgreSQL                          Docker sandbox
+            (runs, steps, events)                 (tests run in here)
+```
+
+<details>
+<summary><b>Full webhook-to-PR sequence diagram</b> (click to expand)</summary>
 
 ```mermaid
 sequenceDiagram
@@ -110,56 +155,33 @@ sequenceDiagram
     Broker->>DB: Final update (status="completed", pr_url, cost, finished_at)
 ```
 
+</details>
 
+### The Coder's toolbox
 
-## Key Features
+The ReAct loop gets five tools, all scoped to the workspace and path-traversal guarded:
 
-- **ReAct reasoning loop:** Full multi-step Reason → Act → Observe → Reason cycle (5-20 steps per issue)
-- **Codebase-aware retrieval:** Parses ASTs, builds call graphs, uses hybrid semantic + structural search 
-- **Sandboxed execution:** Fresh isolated Docker container per run, no network access, read-only host FS
-- **Cost management:** Hard cap on LLM calls, sandbox CPU/time budget, token usage tracking
-- **GitHub integration:** Live webhook-to-PR pipeline, no simulated APIs
-- **Production observability:** Distributed tracing, Prometheus metrics, Grafana dashboards, Kubernetes
+| Tool | What it does |
+|---|---|
+| `retrieve_context` | Semantic search over the indexed repo. The starting point for every run. |
+| `read_file` | Exact file contents. Required before editing. |
+| `edit_file` | Unique-string replacement, or file creation. |
+| `run_tests` | pytest — inside the sandbox when it's enabled, on the host otherwise. |
+| `list_dir` | Directory listing, junk folders filtered. |
 
-## Status
+---
 
-**Live in production** on an Azure VM since 2026-08-03 — see
-[docs/deployment.md](docs/deployment.md).
-
-By component:
-
-- **Codebase understanding** (`agent/retrieval.py`): Done ✅ — tree-sitter chunking, embeddings, in-memory ChromaDB, call graph, token-budgeted context
-- **Multi-agent reasoning** (`agent/planner.py`, `agent/loop.py`, `agent/reviewer.py`): Done ✅ — Planner → Coder (ReAct) → Reviewer, one shared token/USD budget across all three, per-role model selection
-- **GitHub integration** (`agent/github.py`): Done ✅ — REST client with rate-limiting backoff, HMAC verification, idempotent PR creation, hardened git helpers
-- **Docker sandbox** (`agent/sandbox.py`): Built ✅, **off in deployment** — `USE_SANDBOX=false`; a config flip, not a code change (see [docs/deployment.md](docs/deployment.md) §2)
-- **Backend & queue** (`app/`, `workers/`, `db/`): Done ✅ — FastAPI gateway, Celery, Redis broker, PostgreSQL with Alembic migrations, append-only run history
-- **Security**: Done ✅ — HMAC webhooks, authenticated `POST /runs` (fail-closed), repo allowlist, rate limiting, TLS via Caddy
-- **Cloud deployment**: Done ✅ — single Azure VM running the same Compose stack, Let's Encrypt TLS, auto-shutdown for cost control
-- **Tests**: 50 integration tests + 9 module self-tests, all offline and API-key-free
-- **Observability** (`monitoring/`): Not started ⏳ — the `/runs/{id}/steps` trace endpoint covers most of the need today
-
-### Testing
+## Quick start
 
 ```bash
-python -m pytest tests/ -v    # 50 integration tests, no API key needed
-python -m agent.loop          # per-module self-tests (also: planner, reviewer,
-                              # github, sandbox, schemas, db.models, workers.tasks, app.main)
-```
+# 1. Configure
+#    Required: GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET, AGENT_API_TOKEN,
+#              AGENT_REPO_ALLOWLIST, and GEMINI_API_KEY or ANTHROPIC_API_KEY
+$EDITOR .env
 
-Every test was confirmed to **fail** against the pre-fix code before being
-accepted — a test that passes either way proves nothing.
-
-## Quick Start (Docker Compose & Webhooks)
-
-```bash
-# 1. Clone & create environment file
-cp .env.example .env
-# Set GITHUB_TOKEN, GITHUB_WEBHOOK_SECRET, GEMINI_API_KEY / ANTHROPIC_API_KEY,
-# AGENT_API_TOKEN, and AGENT_REPO_ALLOWLIST
-
-# 2. Start the stack (API, Worker, Redis, Postgres, migrations)
+# 2. Bring up the stack — API, worker, Redis, Postgres, migrations
 docker compose up --build -d
-curl localhost:8000/readyz          # {"status":"ready", ... ,"sandbox":"off"}
+curl localhost:8000/readyz          # {"status":"ready", ..., "sandbox":"off"}
 
 # 3. Expose the gateway to GitHub
 ngrok http 8000
@@ -168,16 +190,26 @@ ngrok http 8000
 bash scripts/setup_webhook.sh --repo owner/name --url https://<id>.ngrok-free.app
 bash scripts/setup_webhook.sh --repo owner/name --ping     # expect 204
 
-# 5. Open an issue — the agent solves it and opens a PR
+# 5. Open an issue and watch.
 ```
 
 `setup_webhook.sh` is idempotent **by webhook path**, so re-running it after an
 ngrok restart updates the existing hook instead of piling up dead ones. It also
-supports `--list`, `--ping` and `--delete`.
+takes `--list`, `--ping` and `--delete`.
 
-### Configuration that matters
+### Running it directly, no GitHub involved
 
-Each agent can use its own provider and model. Resolution is role-specific vars →
+```bash
+pip install -r requirements.txt
+python -m agent.loop "Fix the off-by-one in paginate()" \
+    --workspace /path/to/repo --auto-index
+```
+
+Budgets come from `--max-steps` / `--max-usd`; the model comes from env.
+
+### Configuration worth knowing about
+
+Each agent picks its own provider and model. Resolution goes role-specific vars →
 `LLM_*` → a hardcoded default that **can never be empty**:
 
 ```bash
@@ -193,58 +225,208 @@ Anthropic default rather than handing a Gemini model name to the Anthropic API.
 ```bash
 USE_SANDBOX=false            # run tests in the hardened container (needs a Docker daemon)
 AGENT_REPO_ALLOWLIST=...     # repos the agent may touch — enforced on webhook AND POST /runs
-MAX_USD=5.0                  # per-run spend cap, across all three agents
+MAX_USD=5.0                  # per-run spend cap, shared across all three agents
+MAX_STEPS=30                 # cap on Coder model calls
+MAX_REVIEW_ROUNDS=2          # Reviewer → Coder feedback rounds
 ```
 
 ⚠️ These are read **once at process start**. After editing `.env`:
 `docker compose up -d --force-recreate api worker`.
 
-### Manual CLI Usage
+---
+
+## Where things stand
+
+| Component | Status | Notes |
+|---|---|---|
+| Codebase understanding (`agent/retrieval.py`) | ✅ Done | tree-sitter chunking, embeddings, in-memory ChromaDB, token-budgeted context |
+| Multi-agent reasoning (`planner.py`, `loop.py`, `reviewer.py`) | ✅ Done | one shared token/USD budget across all three, per-role model selection |
+| GitHub integration (`agent/github.py`) | ✅ Done | rate-limit backoff, HMAC verification, idempotent PR creation |
+| Backend & queue (`app/`, `workers/`, `db/`) | ✅ Done | FastAPI, Celery, Redis, Postgres + Alembic, append-only run history |
+| Security | ✅ Done | HMAC webhooks, authenticated `POST /runs` (fail-closed), repo allowlist, rate limiting, TLS via Caddy |
+| Cloud deployment | ✅ Done | single Azure VM, same Compose stack, Let's Encrypt, auto-shutdown |
+| Docker sandbox (`agent/sandbox.py`) | ⚙️ Built, **off** | `USE_SANDBOX=false` in deployment — a config flip, not a code change |
+| Observability (`monitoring/`) | ⏳ Not started | `/runs/{id}/steps` covers most of the need today |
+| Eval harness (`eval/`) | ⏳ Not started | **the most important gap — see below** |
+
+### Testing
 
 ```bash
-# 1. Install dependencies (into your virtual environment)
-pip install -r requirements.txt
-
-# 2. Run the agent directly on a task against a local repo
-python -m agent.loop "Fix the off-by-one in paginate()" --workspace /path/to/repo --auto-index
+python -m pytest tests/ -v    # 50 integration tests, no API key needed
+python -m agent.loop          # per-module self-tests (also: planner, reviewer,
+                              # github, sandbox, schemas, db.models, workers.tasks, app.main)
 ```
 
-The model and effort are configurable via env vars (`LLM_PROVIDER`, `LLM_MODEL`,
-`LLM_EFFORT`); budgets via CLI flags (`--max-steps`, `--max-usd`).
+Every test was confirmed to **fail** against the pre-fix code before being
+accepted — a test that passes either way proves nothing.
 
-## Development
+---
 
-The `docs/` folder has deep-dives on each component:
+## Where this goes next
 
-- [docs/deployment.md](docs/deployment.md) — **how it's deployed, what broke getting there, and how to change it**
-- [docs/retrieval.md](docs/retrieval.md) — the codebase understanding engine
-- [docs/loop.md](docs/loop.md) — the ReAct agent loop and tools
-- [docs/github.md](docs/github.md) — GitHub integration: issue intake, PR output, git helpers
-- [docs/sandbox.md](docs/sandbox.md) — the hardened Docker execution sandbox
-- [docs/llm-provider-abstraction.md](docs/llm-provider-abstraction.md) — ADR: pluggable Anthropic/Gemini providers
+Honest read: the plumbing is solid and the retrieval layer is the weakest link.
+Below is what I'd actually build, roughly in order of value-per-day-of-work.
+
+### 1. Build the eval harness first
+
+`eval/` is an empty directory, and that makes every idea below a guess.
+
+The fix is small: a handful of fixture repos with known bugs, known correct
+fixes, and known which files should have been retrieved. Then two numbers —
+**recall@k** for retrieval, **fix rate** for the whole pipeline. Once those
+exist, every change on this list becomes measurable instead of arguable, and
+prompt/budget/model tuning stops being vibes.
+
+This is the highest-leverage thing in the repo, and it's a day of work.
+
+### 2. Fix the retrieval system
+
+This is where the biggest quality wins are hiding.
+
+**It only understands Python.** `walk_py_files()` filters for `.py` and only
+`tree_sitter_python` is loaded. Point this at a TypeScript or Go repo and it
+indexes **zero chunks** — the agent then works blind, from `list_dir` and
+guesses. A language registry mapping extension → grammar → node types would open
+up most of GitHub. Single highest-impact change in the codebase.
+
+**Search is dense-only, and dense embeddings are bad at identifiers.** Ask for
+`paginate_v2` and you're asking a 384-dimension vector to remember an exact
+token — precisely the case where plain keyword search wins. Adding a BM25 leg and
+fusing the two rankings (Reciprocal Rank Fusion is ~40 lines) reliably beats
+either alone. Worth noting: the old README claimed "hybrid semantic + structural
+search" — it wasn't true. This is what would make it true.
+
+**The call graph is built but never used.** `build_call_graph()` works, and
+nothing in the pipeline calls it — only the `__main__` smoke test does. The real
+prize: after the dense hits come back, expand one hop along callers and callees.
+The agent then sees *the code its change will break*, not just the code that
+matched the words. That's the structural half of "hybrid", and it's already
+half-written.
+
+**There's no relevance floor.** `retrieve()` always returns `k` results. Query
+something the repo has nothing to say about, and it confidently returns the `k`
+*least irrelevant* chunks, which `assemble_context` packs into the prompt with a
+straight face. A distance cutoff would make "I found nothing relevant" an
+expressible answer — which is far more useful to a model than plausible noise.
+
+**Big chunks silently get truncated.** `all-MiniLM-L6-v2` caps at ~256 tokens.
+A 400-line method gets embedded on its first ~40 lines; the rest is invisible to
+search forever, with no warning. Either split oversized chunks or embed a
+signature-plus-docstring summary for them.
+
+**No reranking.** Retrieve 30 cheaply, rerank with a cross-encoder, keep the 8
+that actually go in the prompt. This is the standard second stage of every
+serious retrieval pipeline and it's usually the single biggest precision jump
+available.
+
+**The query is raw issue text.** Issues are written in user-voice ("login is
+broken on mobile"); code is written in implementer-voice
+(`validate_session_token`). One cheap LLM call to generate a hypothetical code
+snippet to search with (HyDE), or to fan out into several queries, bridges that
+vocabulary gap directly.
+
+### 3. Sharpen the agent loop
+
+**The toolbox is missing its cheapest tool: literal search.** There's semantic
+search and there's `read_file`, but no `grep`. Models reach for exact-match
+search constantly — "where is `MAX_RETRIES` referenced" is a one-line answer that
+currently costs a semantic query and several file reads. Also missing:
+`run_command` (let it run the linter and type-checker it keeps asking about) and
+`git_diff` (let it see its own work before the Reviewer does).
+
+**`edit_file` is brittle by design.** It needs an exact, unique `old_string`, so
+a single wrong space burns a whole step on a `ToolError`. Indentation-tolerant
+matching, or a line-range replacement mode, would convert a chunk of wasted steps
+into progress.
+
+**Long runs have no memory management.** History grows every step until
+`max_steps` stops it. Summarizing older turns once the transcript crosses a
+threshold buys more real work inside the same budget.
+
+**Investigation is serial.** "Check these four files" is four sequential
+round-trips. Fanning out read-only sub-agents and merging their findings would cut
+wall-clock time on the exploration phase substantially.
+
+### 4. Features worth building
+
+**CI failure recovery.** The agent's PR fails CI → `check_suite` webhook fires →
+it fetches the failing log, re-enters the Coder loop with the failure as context,
+pushes a fix commit, and comments explaining it. This is the natural next feature:
+right now the agent's responsibility ends at "PR opened", which is exactly where
+a real engineer's begins. (Sketched as M16 in `plan2.md`.)
+
+**Respond to human review comments.** A reviewer writes "this doesn't handle
+None" and the agent pushes a fix. The Reviewer agent already exists — this points
+the same machinery at a `pull_request_review_comment` webhook and closes the loop
+with actual humans.
+
+**A dashboard.** `frontend/` is an empty directory, and `/runs/{id}/steps`
+already returns everything a UI needs: every step, every tool call, cost, timing,
+verdicts. A single-page trace viewer — a timeline with expandable steps — would
+turn "50 integration tests pass" into something you can *show* someone.
+
+**Repo-wide and scheduled work.** Nothing about the pipeline requires an issue as
+the trigger. "Fix every TODO in this directory", a weekly dependency-bump PR, or a
+scheduled test-coverage-gap pass are all the same machinery with a different front door.
+
+**Difficulty-aware model routing.** Model choice is static config today. A cheap
+classifier on the issue text — typo fix vs. architectural change — could route
+trivial issues to a cheap model and hard ones to an expensive one, which is
+strictly better than one fixed compromise for both.
+
+**A pre-PR self-check gate.** Before pushing: full suite, linter, and a diff
+sanity check (did it edit files the plan never mentioned? delete tests to make
+them pass?). Cheap insurance against the failure modes that erode trust fastest.
+
+### 5. Infrastructure
+
+- **Turn the sandbox back on.** It's built and hardened; it's off because the
+  deployment VM's constraints, not the code's. This is a config flip plus a
+  memory check.
+- **Observability.** `monitoring/` is empty. Start with one real alert — "a run
+  failed" or "a run cost > $1" — before any dashboard exists. Prometheus/Grafana
+  earn their place later.
+- **Per-run Kubernetes Jobs.** The natural upgrade over sharing a Docker socket:
+  every run gets a genuinely isolated execution context. Deliberately scoped as
+  its own project, never a blocker.
+- **CI/CD.** Lint + pytest → build images → deploy. Worth doing now that the test
+  suite is real.
+- **Small papercut:** the quick start used to say `cp .env.example .env`, but no
+  `.env.example` exists — and `.gitignore` matches `.env.*`, so it would be
+  ignored anyway. Needs a committed template with a `!.env.example` negation rule.
+
+---
+
+## Documentation
+
+The `docs/` folder goes deep on each component:
+
+| Doc | Covers |
+|---|---|
+| [deployment.md](docs/deployment.md) | How it's deployed, what broke getting there, how to change it |
+| [retrieval.md](docs/retrieval.md) | The codebase understanding engine |
+| [loop.md](docs/loop.md) | The ReAct agent loop and its tools |
+| [github.md](docs/github.md) | Issue intake, PR output, git helpers |
+| [sandbox.md](docs/sandbox.md) | The hardened Docker execution sandbox |
+| [persistence.md](docs/persistence.md) | Schema, migrations, append-only runs |
+| [llm-provider-abstraction.md](docs/llm-provider-abstraction.md) | ADR: pluggable Anthropic/Gemini providers |
 
 [plan2.md](plan2.md) is the single source of truth for architecture, decisions
-and open work — including §22, an audit that found 18 defects in the
-multi-agent integration and how each was fixed.
-
-Core tech stack:
-
-- Python 3.12
-- LLM: pluggable — Anthropic Claude **or** Google Gemini, selectable per agent role
-- Docker + Docker Compose
-- FastAPI + Celery + Redis + PostgreSQL
-- Caddy (TLS), Azure VM
-- tree-sitter, sentence-transformers, ChromaDB
-
-The reasoning core is not hard-wired to one vendor. All three agents talk to an
-`LLMProvider` interface, and `resolve_role()` picks the provider and model per
-role at runtime. See the ADR linked above for the contract and rationale.
+and open work — including §22, an audit that found 18 defects in the multi-agent
+integration and how each was fixed.
 
 Kubernetes/Helm and Prometheus/Grafana were in the original design and are
-deliberately **not** built — see `plan2.md` §N5 and §21. A single VM is a
-complete deployment for this workload, and the `/runs/{id}/steps` trace endpoint
-covers most of what dashboards would.
+deliberately **not** built yet — see `plan2.md` §N5 and §21. A single VM is a
+complete deployment for this workload, and `/runs/{id}/steps` covers most of what
+dashboards would.
 
-## About the Author
+## Stack
 
-This project was built by Nadeem, a third-year B.Tech student at IIT Bombay interning at Alimento Agro Foods. Nadeem is preparing for ML/AI engineering roles post-graduation.
+Python 3.12 · FastAPI · Celery · Redis · PostgreSQL · Docker Compose · Caddy ·
+Azure VM · tree-sitter · sentence-transformers · ChromaDB · Anthropic Claude or
+Google Gemini, selectable per agent role.
+
+## About
+
+Built by Nadeem, a third-year B.Tech student at IIT Bombay, interning at Alimento
+Agro Foods and heading for ML/AI engineering roles after graduation.
