@@ -264,136 +264,38 @@ accepted — a test that passes either way proves nothing.
 
 ## Where this goes next
 
-Honest read: the plumbing is solid and the retrieval layer is the weakest link.
-Below is what I'd actually build, roughly in order of value-per-day-of-work.
+Full detail, with measurements, in **[docs/future-goals.md](docs/future-goals.md)**.
 
-### 1. Build the eval harness first
+The short version: the plumbing is solid, **retrieval is the weakest layer**, and
+nothing measures quality end to end — so fix the measuring first.
 
-`eval/` is an empty directory, and that makes every idea below a guess.
+| # | Work | Why |
+|---|---|---|
+| 1 | **Eval harness** — `eval/` is a seed, not a harness | Every other item is an opinion until recall@k and fix-rate exist |
+| 2 | **Index module-level constants** | `parse_file()` only chunks functions, classes and imports — every config constant in every repo is invisible to search |
+| 3 | **Add a relevance floor** | `retrieve()` always returns `k` hits, so "nothing matched" is indistinguishable from a real result |
+| 4 | **Add a `grep` tool** | There is no literal search at all — the escape hatch is missing exactly when retrieval fails |
+| 5 | **Handle oversized chunks** | The embedder truncates at ~256 tokens, silently, so long functions are indexed on their first 40 lines |
+| 6 | **Down-weight test files** | A behavioural query returns 4 tests in the top 5; the implementation lands at rank 4 |
+| 7 | **Multi-language indexing** | Only Python is parsed — a TS or Go repo indexes to *zero chunks* and the agent works blind |
+| 8 | **CI failure recovery** | The agent's job currently ends where a real engineer's begins |
 
-The fix is small: a handful of fixture repos with known bugs, known correct
-fixes, and known which files should have been retrieved. Then two numbers —
-**recall@k** for retrieval, **fix rate** for the whole pipeline. Once those
-exist, every change on this list becomes measurable instead of arguable, and
-prompt/budget/model tuning stops being vibes.
+Beyond that: a trace dashboard (`frontend/` is empty and `/runs/{id}/steps`
+already serves everything a UI needs), replying to human PR review comments,
+difficulty-aware model routing, and a pre-PR self-check gate.
 
-This is the highest-leverage thing in the repo, and it's a day of work.
+These findings are measured, not assumed — the probes are checked in:
 
-### 2. Fix the retrieval system
+```bash
+python eval/probe_retrieval_naming.py    # controlled naming cases
+python eval/probe_retrieval_scale.py     # 445 chunks from this repo
+```
 
-This is where the biggest quality wins are hiding.
-
-**It only understands Python.** `walk_py_files()` filters for `.py` and only
-`tree_sitter_python` is loaded. Point this at a TypeScript or Go repo and it
-indexes **zero chunks** — the agent then works blind, from `list_dir` and
-guesses. A language registry mapping extension → grammar → node types would open
-up most of GitHub. Single highest-impact change in the codebase.
-
-**Search is dense-only, and dense embeddings are bad at identifiers.** Ask for
-`paginate_v2` and you're asking a 384-dimension vector to remember an exact
-token — precisely the case where plain keyword search wins. Adding a BM25 leg and
-fusing the two rankings (Reciprocal Rank Fusion is ~40 lines) reliably beats
-either alone. Worth noting: the old README claimed "hybrid semantic + structural
-search" — it wasn't true. This is what would make it true.
-
-**The call graph is built but never used.** `build_call_graph()` works, and
-nothing in the pipeline calls it — only the `__main__` smoke test does. The real
-prize: after the dense hits come back, expand one hop along callers and callees.
-The agent then sees *the code its change will break*, not just the code that
-matched the words. That's the structural half of "hybrid", and it's already
-half-written.
-
-**There's no relevance floor.** `retrieve()` always returns `k` results. Query
-something the repo has nothing to say about, and it confidently returns the `k`
-*least irrelevant* chunks, which `assemble_context` packs into the prompt with a
-straight face. A distance cutoff would make "I found nothing relevant" an
-expressible answer — which is far more useful to a model than plausible noise.
-
-**Big chunks silently get truncated.** `all-MiniLM-L6-v2` caps at ~256 tokens.
-A 400-line method gets embedded on its first ~40 lines; the rest is invisible to
-search forever, with no warning. Either split oversized chunks or embed a
-signature-plus-docstring summary for them.
-
-**No reranking.** Retrieve 30 cheaply, rerank with a cross-encoder, keep the 8
-that actually go in the prompt. This is the standard second stage of every
-serious retrieval pipeline and it's usually the single biggest precision jump
-available.
-
-**The query is raw issue text.** Issues are written in user-voice ("login is
-broken on mobile"); code is written in implementer-voice
-(`validate_session_token`). One cheap LLM call to generate a hypothetical code
-snippet to search with (HyDE), or to fan out into several queries, bridges that
-vocabulary gap directly.
-
-### 3. Sharpen the agent loop
-
-**The toolbox is missing its cheapest tool: literal search.** There's semantic
-search and there's `read_file`, but no `grep`. Models reach for exact-match
-search constantly — "where is `MAX_RETRIES` referenced" is a one-line answer that
-currently costs a semantic query and several file reads. Also missing:
-`run_command` (let it run the linter and type-checker it keeps asking about) and
-`git_diff` (let it see its own work before the Reviewer does).
-
-**`edit_file` is brittle by design.** It needs an exact, unique `old_string`, so
-a single wrong space burns a whole step on a `ToolError`. Indentation-tolerant
-matching, or a line-range replacement mode, would convert a chunk of wasted steps
-into progress.
-
-**Long runs have no memory management.** History grows every step until
-`max_steps` stops it. Summarizing older turns once the transcript crosses a
-threshold buys more real work inside the same budget.
-
-**Investigation is serial.** "Check these four files" is four sequential
-round-trips. Fanning out read-only sub-agents and merging their findings would cut
-wall-clock time on the exploration phase substantially.
-
-### 4. Features worth building
-
-**CI failure recovery.** The agent's PR fails CI → `check_suite` webhook fires →
-it fetches the failing log, re-enters the Coder loop with the failure as context,
-pushes a fix commit, and comments explaining it. This is the natural next feature:
-right now the agent's responsibility ends at "PR opened", which is exactly where
-a real engineer's begins. (Sketched as M16 in `plan2.md`.)
-
-**Respond to human review comments.** A reviewer writes "this doesn't handle
-None" and the agent pushes a fix. The Reviewer agent already exists — this points
-the same machinery at a `pull_request_review_comment` webhook and closes the loop
-with actual humans.
-
-**A dashboard.** `frontend/` is an empty directory, and `/runs/{id}/steps`
-already returns everything a UI needs: every step, every tool call, cost, timing,
-verdicts. A single-page trace viewer — a timeline with expandable steps — would
-turn "50 integration tests pass" into something you can *show* someone.
-
-**Repo-wide and scheduled work.** Nothing about the pipeline requires an issue as
-the trigger. "Fix every TODO in this directory", a weekly dependency-bump PR, or a
-scheduled test-coverage-gap pass are all the same machinery with a different front door.
-
-**Difficulty-aware model routing.** Model choice is static config today. A cheap
-classifier on the issue text — typo fix vs. architectural change — could route
-trivial issues to a cheap model and hard ones to an expensive one, which is
-strictly better than one fixed compromise for both.
-
-**A pre-PR self-check gate.** Before pushing: full suite, linter, and a diff
-sanity check (did it edit files the plan never mentioned? delete tests to make
-them pass?). Cheap insurance against the failure modes that erode trust fastest.
-
-### 5. Infrastructure
-
-- **Turn the sandbox back on.** It's built and hardened; it's off because the
-  deployment VM's constraints, not the code's. This is a config flip plus a
-  memory check.
-- **Observability.** `monitoring/` is empty. Start with one real alert — "a run
-  failed" or "a run cost > $1" — before any dashboard exists. Prometheus/Grafana
-  earn their place later.
-- **Per-run Kubernetes Jobs.** The natural upgrade over sharing a Docker socket:
-  every run gets a genuinely isolated execution context. Deliberately scoped as
-  its own project, never a blocker.
-- **CI/CD.** Lint + pytest → build images → deploy. Worth doing now that the test
-  suite is real.
-- **Small papercut:** the quick start used to say `cp .env.example .env`, but no
-  `.env.example` exists — and `.gitignore` matches `.env.*`, so it would be
-  ignored anyway. Needs a committed template with a `!.env.example` negation rule.
+One useful negative result: **badly named functions are *not* the weakness they
+look like.** Retrieval embeds the whole chunk, not the name, so a meaningless
+`zorblat()` that paginates is still found at rank 1 for "split a list into fixed
+size pages". Bad naming only bites when the meaning is *also* past the truncation
+window — see §2.1 and §2.3 of the doc.
 
 ---
 
@@ -410,6 +312,7 @@ The `docs/` folder goes deep on each component:
 | [sandbox.md](docs/sandbox.md) | The hardened Docker execution sandbox |
 | [persistence.md](docs/persistence.md) | Schema, migrations, append-only runs |
 | [llm-provider-abstraction.md](docs/llm-provider-abstraction.md) | ADR: pluggable Anthropic/Gemini providers |
+| [future-goals.md](docs/future-goals.md) | What to build next, and the measurements behind the ordering |
 
 [plan2.md](plan2.md) is the single source of truth for architecture, decisions
 and open work — including §22, an audit that found 18 defects in the multi-agent
