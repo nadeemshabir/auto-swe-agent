@@ -364,6 +364,6 @@ approach.
 
 <div align="center">
 <br>
-<sub>Built by Nadeem, a third-year B.Tech student at IIT Bombay, interning at Alimento
-Agro Foods and heading for ML/AI engineering roles after graduation.</sub>
+<sub>Built by Nadeem, a final-year B.Tech student at IIT Bombay, looking for a
+full-time role in ML/AI engineering.</sub>
 </div>
