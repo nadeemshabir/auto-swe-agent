@@ -4,6 +4,7 @@ venv/
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
 
 # Environment secrets — cover every variant, not just the bare name.
 # A timestamped .env.bak once slipped past a plain '.env' rule and was
@@ -11,6 +12,10 @@ __pycache__/
 .env
 .env.*
 *.env
+!.env.example
+
+# Personal planning notes — kept locally, not published
+docs/notes/
 
 # Generated / runtime data (never commit these)
 .chroma/
